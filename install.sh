@@ -47,17 +47,6 @@ run() {
   if [ "$DRY_RUN" = 1 ]; then say "  would: $*"; else "$@"; fi
 }
 
-# The hook wiring, as event:state pairs. PreToolUse matters as much as
-# PostToolUse: without it the tab stays yellow for the whole duration of a
-# long tool call you just approved.
-HOOK_SPEC="UserPromptSubmit:start
-PreToolUse:green
-PostToolUse:green
-Notification:yellow
-Stop:reset
-SessionEnd:reset
-SessionStart:reset"
-
 # --------------------------------------------------------------- the symlink
 
 install_link() {
@@ -88,107 +77,100 @@ remove_link() {
 
 # ---------------------------------------------------------------- the hooks
 
-json_block() {
-  local event state
-  say '"hooks": {'
-  while IFS=: read -r event state; do
-    say "  \"$event\": [{ \"hooks\": [{ \"type\": \"command\", \"command\": \"bash ~/.claude/tab-state.sh $state\" }] }],"
-  done <<<"$HOOK_SPEC"
-  say '}'
-}
-
 # Merge in place with python3 (present on any machine with the Xcode CLT).
-# Reads the spec on argv so the wiring lives in exactly one place.
-merge_hooks() {
-  local mode="$1"
-  python3 - "$SETTINGS" "$mode" "$HOOK_SPEC" <<'PY'
-import json, os, sys
+# The wiring spec lives here and nowhere else in this script; README.md
+# documents the same table for anyone wiring it by hand.
+merge_hooks() { # mode dry_run
+  python3 - "$SETTINGS" "$1" "$2" <<'PY'
+import json, os, re, shutil, sys
 
-path, mode, spec = sys.argv[1], sys.argv[2], sys.argv[3]
-pairs = [line.split(":", 1) for line in spec.splitlines() if line.strip()]
+path, mode, dry = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+
+# PreToolUse matters as much as PostToolUse: without it the tab stays yellow
+# for the whole duration of a long tool call you just approved.
+SPEC = [
+    ("UserPromptSubmit", "start"),
+    ("PreToolUse", "green"),
+    ("PostToolUse", "green"),
+    ("Notification", "yellow"),
+    ("Stop", "reset"),
+    ("SessionEnd", "reset"),
+    ("SessionStart", "reset"),
+]
+
+# Match only the exact commands this script generates (any state, so older
+# wirings are recognised too). A substring test would also claim a wrapper
+# that merely mentions the path, and delete it on uninstall.
+OWNED = re.compile(r"^bash ~/\.claude/tab-state\.sh (?:start|green|yellow|reset)$")
+
+def note(msg):
+    print(("  would: " if dry else "  ") + msg)
 
 data = {}
 if os.path.exists(path):
     with open(path) as fh:
         text = fh.read().strip()
-    data = json.loads(text) if text else {}
+    try:
+        data = json.loads(text) if text else {}
+    except ValueError:
+        print("  %s is not valid JSON — refusing to touch it" % path)
+        sys.exit(1)
 
 hooks = data.get("hooks") or {}
-changed = []
 
-def ours(entry):
-    return "tab-state.sh" in str(entry.get("command", ""))
-
-# Strip our previous entries first so re-running never stacks duplicates,
-# then drop any group we emptied. Everything else is left exactly as-is.
-for event in list(hooks):
+# Strip our previous entries so re-running never stacks duplicates. On install
+# only touch events we are about to rewire: an event we do not ship (someone's
+# hand-wired PreCompact, say) is theirs to keep. Uninstall clears all of them.
+scope = [e for e, _ in SPEC] if mode == "install" else list(hooks)
+for event in scope:
     groups = []
-    for group in hooks[event]:
-        kept = [h for h in group.get("hooks", []) if not ours(h)]
-        if len(kept) != len(group.get("hooks", [])):
-            changed.append("unwired %s" % event)
+    for group in hooks.get(event, []):
+        original = group.get("hooks", [])
+        kept = [h for h in original if not OWNED.match(str(h.get("command", "")))]
+        if len(kept) != len(original):
+            note("unwired %s" % event)
         if kept:
-            group = dict(group, hooks=kept)
-            groups.append(group)
-        elif not group.get("hooks"):
-            groups.append(group)
+            groups.append(dict(group, hooks=kept))
     if groups:
         hooks[event] = groups
-    else:
+    elif event in hooks:
         del hooks[event]
 
 if mode == "install":
-    for event, state in pairs:
+    for event, state in SPEC:
         entry = {"type": "command", "command": "bash ~/.claude/tab-state.sh %s" % state}
         hooks.setdefault(event, []).append({"hooks": [entry]})
-        changed.append("wired %s -> %s" % (event, state))
+        note("wired %s -> %s" % (event, state))
 
 if hooks:
     data["hooks"] = hooks
 elif "hooks" in data:
     del data["hooks"]
 
-rendered = json.dumps(data, indent=2) + "\n"
-json.loads(rendered)  # never write something we cannot read back
-
-if os.environ.get("DRY_RUN") == "1":
-    for c in changed:
-        print("  would: %s" % c)
+if dry:
     sys.exit(0)
 
+# One backup, not a rotation: the write below is atomic, so the copy only has
+# to survive a bad merge, and this script is meant to be re-run freely.
 if os.path.exists(path):
-    backup = path + ".bak"
-    n = 0
-    while os.path.exists(backup):
-        n += 1
-        backup = "%s.bak.%d" % (path, n)
-    with open(path) as src, open(backup, "w") as dst:
-        dst.write(src.read())
-    print("  backup: %s" % backup)
+    shutil.copyfile(path, path + ".bak")
+    print("  backup: %s.bak" % path)
 
 # Write through a temp file so an interrupted install cannot truncate settings.
 tmp = path + ".tmp"
 with open(tmp, "w") as fh:
-    fh.write(rendered)
+    fh.write(json.dumps(data, indent=2) + "\n")
 os.replace(tmp, path)
-for c in changed:
-    print("  %s" % c)
 PY
 }
 
 install_hooks() {
   if ! command -v python3 >/dev/null 2>&1; then
-    say "hooks: python3 not found — add this to $SETTINGS by hand:"
-    json_block
-    return 1
-  fi
-  if [ -e "$SETTINGS" ] && ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$SETTINGS" 2>/dev/null; then
-    say "hooks: $SETTINGS is not valid JSON — refusing to touch it"
+    say "hooks: python3 not found — see the manual wiring block in README.md"
     return 1
   fi
   say "hooks:"
-  export DRY_RUN
-  merge_hooks "$1"
+  merge_hooks "$1" "$DRY_RUN"
 }
 
 # ------------------------------------------------------------------- driver

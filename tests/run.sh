@@ -1,10 +1,10 @@
 #!/bin/bash
-# Test harness for tab-state.sh / toggle.sh.
+# Test harness for tab-state.sh / toggle.sh / install.sh.
 #
 # The scripts are driven through their env seams instead of a real terminal:
 # TAB_STATE_DEV redirects the escapes to a file we can diff, TAB_STATE_FORCE
 # skips iTerm2 detection, and HOME is a throwaway dir so the flag file, stop
-# markers and tty registry never touch the real ~/.claude.
+# markers and the tty registry never touch the real ~/.claude.
 #
 #   tests/run.sh          # run all
 #   tests/run.sh green    # run tests whose name matches "green"
@@ -14,6 +14,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TAB_STATE="$ROOT/tab-state.sh"
 TOGGLE="$ROOT/toggle.sh"
+INSTALL="$ROOT/install.sh"
 FILTER="${1:-}"
 
 pass=0
@@ -27,18 +28,30 @@ YELLOW="${ESC}]6;1;bg;red;brightness;235${BEL}${ESC}]6;1;bg;green;brightness;190
 DEFAULT="${ESC}]6;1;bg;*;default${BEL}"
 
 setup() {
+  teardown
   SANDBOX=$(mktemp -d)
   export HOME="$SANDBOX/home"
   mkdir -p "$HOME/.claude"
   export TAB_STATE_DEV="$SANDBOX/out"
   export TAB_STATE_FORCE=1
-  unset TMUX STY TAB_STATE_TMUX 2>/dev/null || true
+  unset TMUX STY
   : >"$TAB_STATE_DEV"
+  STATE_DIR="$HOME/.claude/.tab-state"
+  REGISTRY="$STATE_DIR/tty-out"
+  MARKER="$STATE_DIR/stopped-out"
+  DISABLED="$HOME/.claude/tab-state.disabled"
+  SETTINGS="$HOME/.claude/settings.json"
 }
 
-teardown() { [ -n "${SANDBOX:-}" ] && rm -rf "$SANDBOX"; }
+teardown() {
+  [ -n "${SANDBOX:-}" ] && rm -rf "$SANDBOX"
+  SANDBOX=""
+}
+trap teardown EXIT
 
 out() { cat "$TAB_STATE_DEV"; }
+clear_out() { : >"$TAB_STATE_DEV"; }
+exists() { if [ -e "$1" ]; then echo present; else echo absent; fi; }
 
 # Render escapes readable so a mismatch is diagnosable.
 show() { printf '%s' "$1" | sed -e "s/$ESC/<ESC>/g" -e "s/$BEL/<BEL>/g"; }
@@ -55,10 +68,14 @@ check() { # name expected actual
   fi
 }
 
-it() { # name -> skipped unless it matches $FILTER
+# Matching tests get a fresh sandbox; the last one is cleaned by the EXIT trap.
+it() {
   CURRENT="$1"
   case "$CURRENT" in
-    *"$FILTER"*) return 0 ;;
+    *"$FILTER"*)
+      setup
+      return 0
+      ;;
     *) return 1 ;;
   esac
 }
@@ -66,94 +83,55 @@ it() { # name -> skipped unless it matches $FILTER
 # ---------------------------------------------------------------- arg handling
 
 if it "rejects a missing argument"; then
-  setup
   err=$("$TAB_STATE" 2>&1 >/dev/null)
-  rc=$?
-  check "$CURRENT: exit 1" "1" "$rc"
-  case "$err" in
-    usage:*) check "$CURRENT: prints usage" "yes" "yes" ;;
-    *) check "$CURRENT: prints usage" "usage: ..." "$err" ;;
-  esac
-  teardown
+  check "$CURRENT: exit 1" "1" "$?"
+  check "$CURRENT: prints usage" "usage: tab-state.sh {start|green|yellow|reset}" "$err"
 fi
 
 if it "rejects an unknown state"; then
-  setup
   "$TAB_STATE" gren 2>/dev/null
   check "$CURRENT: exit 1" "1" "$?"
   check "$CURRENT: writes nothing" "" "$(out)"
-  teardown
 fi
 
 # ------------------------------------------------------------------- happy path
 
-if it "green paints the tab green"; then
-  setup
-  "$TAB_STATE" green
-  check "$CURRENT" "$GREEN" "$(out)"
-  teardown
-fi
+paints() { # state expected
+  it "$1 paints the tab" || return 0
+  "$TAB_STATE" "$1"
+  check "$CURRENT" "$2" "$(out)"
+}
+paints green "$GREEN"
+paints start "$GREEN"
+paints reset "$DEFAULT"
 
-if it "start paints the tab green"; then
-  setup
-  "$TAB_STATE" start
-  check "$CURRENT" "$GREEN" "$(out)"
-  teardown
-fi
-
-if it "reset restores the default color"; then
-  setup
-  "$TAB_STATE" reset
-  check "$CURRENT" "$DEFAULT" "$(out)"
-  teardown
+if it "paints without writing to stderr"; then
+  # A missing stop marker is the normal case, so the redirect that reads it
+  # must not leak "No such file or directory" into the hook's stderr.
+  check "$CURRENT (green)" "" "$("$TAB_STATE" green 2>&1 >/dev/null)"
+  check "$CURRENT (start)" "" "$("$TAB_STATE" start 2>&1 >/dev/null)"
+  check "$CURRENT (reset)" "" "$("$TAB_STATE" reset 2>&1 >/dev/null)"
 fi
 
 # ------------------------------------------------------------ notification path
 
-if it "yellow paints a real permission prompt"; then
-  setup
-  echo '{"message":"Claude needs your permission to use Bash"}' | "$TAB_STATE" yellow
-  check "$CURRENT" "$YELLOW" "$(out)"
-  teardown
-fi
-
-if it "yellow resets on the idle nudge"; then
-  setup
-  echo '{"message":"Claude is waiting for your input"}' | "$TAB_STATE" yellow
-  check "$CURRENT" "$DEFAULT" "$(out)"
-  teardown
-fi
-
-if it "yellow ignores the idle wording outside the message field"; then
-  setup
-  echo '{"cwd":"/tmp/waiting for your input","message":"Claude needs your permission to use Bash"}' |
-    "$TAB_STATE" yellow
-  check "$CURRENT" "$YELLOW" "$(out)"
-  teardown
-fi
-
-if it "yellow parses the message without jq"; then
-  setup
-  stub="$SANDBOX/bin"
-  mkdir -p "$stub"
-  for c in sed grep printf date stat ps awk rm mkdir cat; do
-    p=$(command -v "$c" 2>/dev/null) && ln -sf "$p" "$stub/$c"
-  done
-  echo '{"message":"Claude is waiting for your input"}' |
-    PATH="$stub" "$TAB_STATE" yellow
-  check "$CURRENT" "$DEFAULT" "$(out)"
-  teardown
-fi
-
-if it "yellow defaults to alerting on an unparseable payload"; then
-  setup
-  printf 'not json at all' | "$TAB_STATE" yellow
-  check "$CURRENT" "$YELLOW" "$(out)"
-  teardown
-fi
+yellow_case() { # name payload expected
+  it "$1" || return 0
+  printf '%s' "$2" | "$TAB_STATE" yellow
+  check "$CURRENT" "$3" "$(out)"
+}
+yellow_case "yellow paints a real permission prompt" \
+  '{"message":"Claude needs your permission to use Bash"}' "$YELLOW"
+yellow_case "yellow resets on the idle nudge" \
+  '{"message":"Claude is waiting for your input"}' "$DEFAULT"
+yellow_case "yellow matches the nudge case-insensitively" \
+  '{"message":"Claude is WAITING FOR YOUR INPUT"}' "$DEFAULT"
+yellow_case "yellow ignores the idle wording outside the message field" \
+  '{"cwd":"/tmp/waiting for your input","message":"needs your permission"}' "$YELLOW"
+yellow_case "yellow defaults to alerting on an unparseable payload" \
+  'not json at all' "$YELLOW"
 
 if it "yellow does not hang on an open stdin"; then
-  setup
   # A fifo held open by a slow writer. It must be a fifo rather than a pipeline:
   # bash waits for every member of a pipeline, so `sleep 6 | script` would time
   # the writer even after the script has already given up.
@@ -174,165 +152,141 @@ if it "yellow does not hang on an open stdin"; then
   else
     check "$CURRENT" "under 5s" "${elapsed}s"
   fi
-  teardown
 fi
 
-# ------------------------------------------------------------ stop-marker race
+# --------------------------------------------------------------- the turn latch
 
-if it "green is suppressed immediately after a reset"; then
-  setup
+if it "green is suppressed while the turn is closed"; then
   "$TAB_STATE" reset
-  : >"$TAB_STATE_DEV"
+  clear_out
   "$TAB_STATE" green
   check "$CURRENT" "" "$(out)"
-  teardown
 fi
 
-if it "start clears the stop marker so the next turn paints"; then
-  setup
+if it "the latch holds well past a couple of seconds"; then
+  # The old implementation used a 2s window; a late green must still lose.
+  "$TAB_STATE" reset
+  clear_out
+  printf '%s\n' "$(($(date +%s) - 30))" >"$MARKER"
+  "$TAB_STATE" green
+  check "$CURRENT" "" "$(out)"
+fi
+
+if it "start reopens the turn so the next green paints"; then
   "$TAB_STATE" reset
   "$TAB_STATE" start
-  : >"$TAB_STATE_DEV"
+  clear_out
   "$TAB_STATE" green
   check "$CURRENT" "$GREEN" "$(out)"
-  teardown
 fi
 
-if it "green resumes once the stop marker ages out"; then
-  setup
+if it "a turn that never sends start self-heals"; then
   "$TAB_STATE" reset
-  # Backdate the marker past the 2s suppression window.
-  touch -t 202001010000 "$HOME/.claude/.tab-state/stopped-out"
-  : >"$TAB_STATE_DEV"
+  printf '%s\n' "$(($(date +%s) - 3600))" >"$MARKER"
+  clear_out
   "$TAB_STATE" green
   check "$CURRENT" "$GREEN" "$(out)"
-  teardown
 fi
 
 # --------------------------------------------------------------- disable flag
 
-if it "the disable flag forces a reset for every state"; then
-  setup
-  : >"$HOME/.claude/tab-state.disabled"
-  for s in start green reset; do
-    : >"$TAB_STATE_DEV"
-    "$TAB_STATE" "$s"
-    check "$CURRENT ($s)" "$DEFAULT" "$(out)"
-  done
-  : >"$TAB_STATE_DEV"
-  echo '{"message":"needs permission"}' | "$TAB_STATE" yellow
-  check "$CURRENT (yellow)" "$DEFAULT" "$(out)"
-  teardown
+if it "the disable flag clears painted tabs and drains the registry"; then
+  "$TAB_STATE" green
+  : >"$DISABLED"
+  clear_out
+  "$TAB_STATE" green
+  check "$CURRENT (cleared)" "$DEFAULT" "$(out)"
+  check "$CURRENT (drained)" "absent" "$(exists "$REGISTRY")"
+fi
+
+if it "the disable flag stays silent once nothing is painted"; then
+  : >"$DISABLED"
+  "$TAB_STATE" green
+  check "$CURRENT" "" "$(out)"
 fi
 
 # ------------------------------------------------------------- terminal guards
 
 if it "stays silent outside iTerm2"; then
-  setup
   unset TAB_STATE_FORCE
   LC_TERMINAL="" TERM_PROGRAM="Apple_Terminal" "$TAB_STATE" green
   check "$CURRENT" "" "$(out)"
-  teardown
 fi
 
 if it "recognizes iTerm2 from LC_TERMINAL"; then
-  setup
   unset TAB_STATE_FORCE
   LC_TERMINAL="iTerm2" TERM_PROGRAM="" "$TAB_STATE" green
   check "$CURRENT" "$GREEN" "$(out)"
-  teardown
 fi
 
-if it "stays silent under tmux unless opted in"; then
-  setup
+if it "stays silent under tmux"; then
   TMUX="/tmp/tmux-0/default,1,0" "$TAB_STATE" green
   check "$CURRENT" "" "$(out)"
-  teardown
 fi
 
-if it "wraps escapes for tmux passthrough when opted in"; then
-  setup
-  TMUX="/tmp/tmux-0/default,1,0" TAB_STATE_TMUX=1 "$TAB_STATE" reset
-  expected="${ESC}Ptmux;${ESC}${ESC}]6;1;bg;*;default${BEL}${ESC}\\"
-  check "$CURRENT" "$expected" "$(out)"
-  teardown
+if it "stays silent under screen"; then
+  STY="1234.pts-0.host" "$TAB_STATE" green
+  check "$CURRENT" "" "$(out)"
 fi
 
 # ---------------------------------------------------------------- tty registry
 
 if it "registers the tty it paints"; then
-  setup
   "$TAB_STATE" green
-  check "$CURRENT" "$TAB_STATE_DEV" "$(cat "$HOME/.claude/.tab-state/ttys")"
-  teardown
+  check "$CURRENT" "$TAB_STATE_DEV" "$(cat "$REGISTRY")"
 fi
 
-if it "registers each tty only once"; then
-  setup
+if it "registering is idempotent"; then
   "$TAB_STATE" start
-  "$TAB_STATE" start
-  "$TAB_STATE" start
-  check "$CURRENT" "1" "$(wc -l <"$HOME/.claude/.tab-state/ttys" | tr -d ' ')"
-  teardown
+  "$TAB_STATE" green
+  "$TAB_STATE" green
+  check "$CURRENT" "1" "$(wc -l <"$REGISTRY" | tr -d ' ')"
 fi
 
 if it "does not register on reset"; then
-  setup
   "$TAB_STATE" reset
-  check "$CURRENT" "no registry" "$([ -e "$HOME/.claude/.tab-state/ttys" ] && echo registry || echo "no registry")"
-  teardown
+  check "$CURRENT" "absent" "$(exists "$REGISTRY")"
 fi
 
 # -------------------------------------------------------------------- toggle.sh
 
 if it "toggle reports status"; then
-  setup
   check "$CURRENT (on)" "tab-state: ON" "$("$TOGGLE" status)"
-  : >"$HOME/.claude/tab-state.disabled"
+  : >"$DISABLED"
   check "$CURRENT (off)" "tab-state: OFF" "$("$TOGGLE" status)"
-  teardown
 fi
 
 if it "toggle flips both directions"; then
-  setup
   check "$CURRENT (to off)" "tab-state: OFF" "$("$TOGGLE" 2>/dev/null)"
   check "$CURRENT (to on)" "tab-state: ON" "$("$TOGGLE" 2>/dev/null)"
-  teardown
 fi
 
 if it "toggle off clears registered tabs"; then
-  setup
   "$TAB_STATE" green
-  : >"$TAB_STATE_DEV"
+  clear_out
   "$TOGGLE" off >/dev/null 2>&1
   check "$CURRENT" "$DEFAULT" "$(out)"
-  teardown
 fi
 
 if it "toggle off prunes dead ttys from the registry"; then
-  setup
   "$TAB_STATE" green
-  echo "$SANDBOX/gone" >>"$HOME/.claude/.tab-state/ttys"
+  echo "$SANDBOX/gone" >"$STATE_DIR/tty-gone"
   "$TOGGLE" off >/dev/null 2>&1
-  check "$CURRENT" "$TAB_STATE_DEV" "$(cat "$HOME/.claude/.tab-state/ttys")"
-  teardown
+  check "$CURRENT (dead dropped)" "absent" "$(exists "$STATE_DIR/tty-gone")"
+  check "$CURRENT (live kept)" "present" "$(exists "$REGISTRY")"
 fi
 
 if it "toggle rejects an unknown subcommand"; then
-  setup
   "$TOGGLE" bogus >/dev/null 2>&1
   check "$CURRENT: exit 2" "2" "$?"
-  teardown
 fi
 
 # -------------------------------------------------------------------- install.sh
 
-INSTALL="$ROOT/install.sh"
-
 # settings.json with an unrelated hook plus the old-style wiring, so we can
 # assert the merge is surgical.
 seed_settings() {
-  cat >"$HOME/.claude/settings.json" <<'JSON'
+  cat >"$SETTINGS" <<'JSON'
 {
   "model": "opus",
   "hooks": {
@@ -344,96 +298,101 @@ seed_settings() {
 JSON
 }
 
-settings_query() { python3 -c "$1" "$HOME/.claude/settings.json"; }
-
-COUNT_OURS='import json,sys
+count_hooks() { # substring -> how many hook commands contain it
+  python3 -c 'import json,sys
 d=json.load(open(sys.argv[1]))
-print(sum(1 for gs in d.get("hooks",{}).values() for g in gs for h in g["hooks"] if "tab-state.sh" in h["command"]))'
-COUNT_FOREIGN='import json,sys
-d=json.load(open(sys.argv[1]))
-print(sum(1 for gs in d.get("hooks",{}).values() for g in gs for h in g["hooks"] if "unrelated-tool" in h["command"]))'
+print(sum(1 for gs in d.get("hooks",{}).values() for g in gs
+          for h in g["hooks"] if sys.argv[2] in h["command"]))' "$SETTINGS" "$1"
+}
 
 if it "install wires every event"; then
-  setup
   seed_settings
   "$INSTALL" >/dev/null 2>&1
-  check "$CURRENT" "7" "$(settings_query "$COUNT_OURS")"
-  teardown
+  check "$CURRENT" "7" "$(count_hooks tab-state.sh)"
 fi
 
 if it "install preserves unrelated settings and hooks"; then
-  setup
   seed_settings
   "$INSTALL" >/dev/null 2>&1
-  check "$CURRENT (model)" "opus" "$(settings_query 'import json,sys; print(json.load(open(sys.argv[1]))["model"])')"
-  check "$CURRENT (foreign hook)" "1" "$(settings_query "$COUNT_FOREIGN")"
-  teardown
+  check "$CURRENT (model)" "opus" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"])' "$SETTINGS")"
+  check "$CURRENT (foreign hook)" "1" "$(count_hooks unrelated-tool)"
+fi
+
+if it "install leaves hand-wired events it does not ship"; then
+  seed_settings
+  python3 - "$SETTINGS" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["hooks"]["PreCompact"] = [{"hooks": [
+    {"type": "command", "command": "bash ~/.claude/tab-state.sh reset"}]}]
+json.dump(d, open(p, "w"))
+PY
+  "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT" "1" \
+    "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["hooks"].get("PreCompact",[])))' "$SETTINGS")"
+fi
+
+if it "install does not claim a wrapper that merely mentions the path"; then
+  cat >"$SETTINGS" <<'JSON'
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"my-wrapper.sh --then tab-state.sh reset"}]}]}}
+JSON
+  "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT" "1" "$(count_hooks my-wrapper.sh)"
 fi
 
 if it "install is idempotent"; then
-  setup
   seed_settings
   "$INSTALL" >/dev/null 2>&1
   "$INSTALL" >/dev/null 2>&1
   "$INSTALL" >/dev/null 2>&1
-  check "$CURRENT (ours)" "7" "$(settings_query "$COUNT_OURS")"
-  check "$CURRENT (foreign)" "1" "$(settings_query "$COUNT_FOREIGN")"
-  teardown
+  check "$CURRENT (ours)" "7" "$(count_hooks tab-state.sh)"
+  check "$CURRENT (foreign)" "1" "$(count_hooks unrelated-tool)"
+  check "$CURRENT (one backup)" "1" "$(find "$HOME/.claude" -name 'settings.json.bak*' | wc -l | tr -d ' ')"
 fi
 
 if it "install --dry-run writes nothing"; then
-  setup
   seed_settings
-  before=$(cat "$HOME/.claude/settings.json")
+  before=$(cat "$SETTINGS")
   "$INSTALL" --dry-run >/dev/null 2>&1
-  check "$CURRENT (settings)" "$before" "$(cat "$HOME/.claude/settings.json")"
-  check "$CURRENT (symlink)" "absent" "$([ -e "$HOME/.claude/tab-state.sh" ] && echo present || echo absent)"
-  teardown
+  check "$CURRENT (settings)" "$before" "$(cat "$SETTINGS")"
+  check "$CURRENT (symlink)" "absent" "$(exists "$HOME/.claude/tab-state.sh")"
 fi
 
 if it "install replaces a drifted regular-file copy with a symlink"; then
-  setup
   cp "$TAB_STATE" "$HOME/.claude/tab-state.sh"
   "$INSTALL" --no-hooks >/dev/null 2>&1
   check "$CURRENT (link)" "$TAB_STATE" "$(readlink "$HOME/.claude/tab-state.sh")"
-  check "$CURRENT (backup)" "present" "$([ -e "$HOME/.claude/tab-state.sh.bak" ] && echo present || echo absent)"
-  teardown
+  check "$CURRENT (backup)" "present" "$(exists "$HOME/.claude/tab-state.sh.bak")"
 fi
 
 if it "install backs settings up before rewriting"; then
-  setup
   seed_settings
-  before=$(cat "$HOME/.claude/settings.json")
+  before=$(cat "$SETTINGS")
   "$INSTALL" >/dev/null 2>&1
-  check "$CURRENT" "$before" "$(cat "$HOME/.claude/settings.json.bak")"
-  teardown
+  check "$CURRENT" "$before" "$(cat "$SETTINGS.bak")"
 fi
 
 if it "install refuses to touch malformed settings"; then
-  setup
-  echo '{ broken' >"$HOME/.claude/settings.json"
+  echo '{ broken' >"$SETTINGS"
   "$INSTALL" >/dev/null 2>&1
   check "$CURRENT (exit 1)" "1" "$?"
-  check "$CURRENT (untouched)" "{ broken" "$(cat "$HOME/.claude/settings.json")"
-  teardown
+  check "$CURRENT (untouched)" "{ broken" "$(cat "$SETTINGS")"
 fi
 
 if it "uninstall removes only our entries"; then
-  setup
   seed_settings
   "$INSTALL" >/dev/null 2>&1
   "$INSTALL" --uninstall >/dev/null 2>&1
-  check "$CURRENT (ours)" "0" "$(settings_query "$COUNT_OURS")"
-  check "$CURRENT (foreign)" "1" "$(settings_query "$COUNT_FOREIGN")"
-  check "$CURRENT (symlink)" "absent" "$([ -e "$HOME/.claude/tab-state.sh" ] && echo present || echo absent)"
-  teardown
+  check "$CURRENT (ours)" "0" "$(count_hooks tab-state.sh)"
+  check "$CURRENT (foreign)" "1" "$(count_hooks unrelated-tool)"
+  check "$CURRENT (symlink)" "absent" "$(exists "$HOME/.claude/tab-state.sh")"
 fi
 
 if it "install rejects an unknown option"; then
-  setup
   "$INSTALL" --nope >/dev/null 2>&1
   check "$CURRENT: exit 2" "2" "$?"
-  teardown
 fi
 
 # ------------------------------------------------------------------------ result

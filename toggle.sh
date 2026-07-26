@@ -7,27 +7,27 @@
 #   toggle.sh status    # print current state
 #
 # Disabling drops a flag file that tab-state.sh checks; while present, every
-# hook call just resets the tab to its default color instead of signaling.
+# hook call clears anything we painted instead of signaling.
 
 set -u
 
 FLAG="${HOME}/.claude/tab-state.disabled"
 STATE_DIR="${HOME}/.claude/.tab-state"
-TTY_REGISTRY="${STATE_DIR}/ttys"
+RESET_SEQ='\033]6;1;bg;*;default\007'
 
-# Clear every tab we have ever colored. Without this, an idle tab keeps its
+# Clear every tab we have ever painted. Without this, an idle tab keeps its
 # color until it happens to see another hook event, which may be never.
 reset_registered_ttys() {
-  local dev kept=""
-  [ -e "$TTY_REGISTRY" ] || return 0
-  while IFS= read -r dev; do
-    [ -n "$dev" ] || continue
-    # Drop ttys that are gone; keeping them would grow the file forever.
-    [ -w "$dev" ] || continue
-    printf '\033]6;1;bg;*;default\007' >"$dev" 2>/dev/null
-    kept="${kept}${dev}"$'\n'
-  done <"$TTY_REGISTRY"
-  printf '%s' "$kept" >"$TTY_REGISTRY" 2>/dev/null
+  local f dev
+  for f in "$STATE_DIR"/tty-*; do
+    [ -e "$f" ] || continue
+    read -r dev 2>/dev/null <"$f" || continue
+    if [ -w "$dev" ]; then
+      printf '%b' "$RESET_SEQ" >"$dev" 2>/dev/null
+    else
+      rm -f "$f" # the tty is gone; drop the record
+    fi
+  done
 }
 
 enable() {
@@ -41,7 +41,7 @@ disable() {
   echo "tab-state: OFF"
   reset_registered_ttys
   # The current terminal may not be registered yet (no hook has fired in it).
-  { printf '\033]6;1;bg;*;default\007' >/dev/tty; } 2>/dev/null || true
+  { printf '%b' "$RESET_SEQ" >/dev/tty; } 2>/dev/null || true
 }
 
 status() {

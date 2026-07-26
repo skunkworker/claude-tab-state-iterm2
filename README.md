@@ -58,8 +58,9 @@ Only changing the wiring above requires `/hooks`.
 ```
 
 `off` drops `~/.claude/tab-state.disabled` and immediately clears every tab the
-script has ever colored. While the flag exists, each hook call just resets the
-tab instead of signaling.
+script has ever colored. While the flag exists, each hook call clears anything
+still colored and exits before doing any real work, so a disabled feature costs
+almost nothing per tool call.
 
 ## How it works
 
@@ -78,7 +79,10 @@ tab instead of signaling.
   version "never changed colors"). The script walks up the process tree from
   `$PPID` to the parent `claude` process and writes to its real `/dev/ttysNNN`.
   Each session resolves its own tty, so multiple instances color the right tab.
-  The walk uses a single `ps` snapshot because it runs on every `PostToolUse`.
+  The walk asks each level for `ppid` and `tty` in one `ps`, which matters
+  because it runs on every `PostToolUse`. A single full-table `ps -ax` snapshot
+  needs fewer processes but measures about twice as slow — it resolves the tty
+  name of every process on the machine.
 
 - **Idle vs. real prompts.** The `Notification` event fires both for genuine
   permission/question prompts **and** for the idle "Claude is waiting for your
@@ -90,9 +94,12 @@ tab instead of signaling.
 - **Not getting stuck.** `Stop` does not fire when you interrupt, quit, or
   crash, which used to leave the tab green with nothing behind it — hence
   `SessionEnd`. And with parallel tool calls a slow `PostToolUse` green can
-  land *after* `Stop`'s reset, so `reset` drops a marker that suppresses green
-  for the next two seconds; `start` clears it so a genuine new turn always
-  paints.
+  land *after* `Stop`'s reset. Nothing in the payload can order those two, so
+  `reset` closes the turn and `start` reopens it: green does not paint in
+  between. It is a latch rather than a timeout, because any timeout short
+  enough to be useful is also short enough to lose under load. A closed turn
+  does expire after 60s so that a session resumed without a `start` heals
+  itself rather than staying dark.
 
 - **Why `PreToolUse` too.** `PostToolUse` fires when a tool *finishes*. Without
   `PreToolUse`, approving a three-minute test run leaves the tab yellow for the
@@ -103,13 +110,12 @@ tab instead of signaling.
 - **macOS + iTerm2.** The script checks `LC_TERMINAL` / `TERM_PROGRAM` and stays
   silent elsewhere, because terminals without OSC 6 support render the escape as
   literal garbage in the scrollback. Set `TAB_STATE_FORCE=1` to override.
-- **tmux / screen are off by default.** The escape reaches the multiplexer
-  rather than the tab. Set `TAB_STATE_TMUX=1` to wrap it in tmux's DCS
-  passthrough, which also needs `set -g allow-passthrough on` in your tmux
-  config. Note that all panes share one iTerm2 tab, so the signal is per-window
-  at best.
-- **`jq` is optional.** It is used to read the notification message if present;
-  otherwise a `sed` fallback handles it.
+- **tmux / screen are unsupported.** The escape reaches the multiplexer rather
+  than the tab, so the script stays silent there. DCS passthrough was tried and
+  removed: every pane shares one iTerm2 tab, so the signal cannot mean what it
+  means everywhere else.
+- **No dependencies beyond bash.** `install.sh` needs `python3` to edit
+  `settings.json`; `tab-state.sh` itself shells out only to `ps` and `date`.
 
 ## Customizing
 

@@ -2,7 +2,7 @@
 # Reflect Claude Code state in the iTerm2 tab via the native TAB COLOR.
 # Usage: tab-state.sh {start|green|yellow|reset}
 #
-#   start  = new turn began (clears the stop marker, then green)
+#   start  = a new turn began (opens the turn, then paints green)
 #   green  = Claude is running
 #   yellow = Claude needs you (real permission/question prompt)
 #   reset  = default tab color (Claude is done / idle / session over)
@@ -17,27 +17,102 @@
 # Hooks run in a subprocess with NO controlling terminal, so /dev/tty fails.
 # We walk up the process tree to the parent `claude` process's real tty.
 #
+# This runs on every PreToolUse and PostToolUse, so the cost of a single call
+# is the design constraint throughout: guards are ordered cheapest-first and
+# everything below them avoids forking where bash can do the job.
+#
 # Env overrides (mainly for tests and unusual setups):
 #   TAB_STATE_DEV    write escapes here instead of resolving a tty
 #   TAB_STATE_FORCE  =1 skips the iTerm2 detection guard
-#   TAB_STATE_TMUX   =1 enables tmux passthrough wrapping
 
 set -u
 
-usage() {
-  echo "usage: tab-state.sh {start|green|yellow|reset}" >&2
-  # Exit 1, never 2: Claude Code treats hook exit 2 as "block this tool call".
-  exit 1
-}
-
-state="${1:-}"
-case "$state" in
-  start | green | yellow | reset) ;;
-  *) usage ;;
-esac
-
+RESET_SEQ='\033]6;1;bg;*;default\007'
 DISABLE_FLAG="${HOME:-}/.claude/tab-state.disabled"
 STATE_DIR="${HOME:-}/.claude/.tab-state"
+
+# A turn with no `start` (a resumed or compacted session) would otherwise keep
+# the tab dark for its whole duration, so the closed turn self-heals after this
+# many seconds. It only has to outlast scheduling skew between two hook
+# subprocesses, so it is deliberately far larger than that rather than tuned.
+STALE_AFTER=60
+
+# ------------------------------------------------------------------ functions
+
+# One `ps` per level, asking for both fields at once. A single full-table
+# `ps -ax` snapshot needs fewer forks but measures ~2x slower: it resolves the
+# tty name of every process on the machine. Depth to `claude` is ~3.
+resolve_dev() {
+  local pid=$PPID line ppid tty
+  for _ in 1 2 3 4 5 6 7 8; do
+    line=$(ps -o ppid=,tty= -p "$pid" 2>/dev/null) || return 1
+    [ -n "$line" ] || return 1
+    read -r ppid tty <<<"$line"
+    case "$tty" in
+      ttys*)
+        printf '/dev/%s' "$tty"
+        return 0
+        ;;
+    esac
+    [ -n "$ppid" ] && [ "$ppid" != 0 ] || return 1
+    pid=$ppid
+  done
+  return 1
+}
+
+emit() { printf '%b' "$1" >"$dev" 2>/dev/null; }
+
+set_color() { # r g b
+  emit "\033]6;1;bg;red;brightness;$1\007\033]6;1;bg;green;brightness;$2\007\033]6;1;bg;blue;brightness;$3\007"
+}
+reset_color() { emit "$RESET_SEQ"; }
+
+# One file per tty rather than one shared list: registration is an idempotent
+# write with no read, no dedupe, and no interleaving between the parallel hook
+# processes that can run at once. Matches how the stop marker is keyed.
+register_tty() { printf '%s\n' "$dev" >"${STATE_DIR}/tty-${dev##*/}" 2>/dev/null; }
+
+# True while the turn is closed. `reset` closes it, `start` reopens it — a
+# latch rather than a timeout, because nothing in the payload can order a
+# PostToolUse green against the Stop that races it. The timestamp is only the
+# staleness backstop above. Costs zero forks when the marker is absent, which
+# is the whole of a normal turn.
+turn_is_closed() {
+  local stamped now
+  # stderr is silenced before the input redirect, not after: redirections are
+  # applied left to right, and a missing marker is the normal case.
+  read -r stamped 2>/dev/null <"$STOP_MARKER" || return 1
+  now=$(date +%s) || return 1
+  [ $((now - stamped)) -lt "$STALE_AFTER" ]
+}
+
+# Pull the notification text out of the payload without forking. jq would cost
+# two processes on the one path where a human is actively waiting, and neither
+# it nor a sed fallback is worth that here: this is a substring test, not a
+# parse. Like the sed version, it does not unescape JSON strings.
+notif_message() { # -> MSG
+  local m=$1
+  MSG=""
+  case "$m" in
+    *'"message"'*) ;;
+    *) return 0 ;;
+  esac
+  m=${m#*'"message"'}
+  m=${m#*:}
+  m=${m#*'"'}
+  MSG=${m%%'"'*}
+}
+
+# ------------------------------------------------------- guards, cheapest first
+
+case "${1:-}" in
+  start | green | yellow | reset) state="$1" ;;
+  *)
+    echo "usage: tab-state.sh {start|green|yellow|reset}" >&2
+    # Exit 1, never 2: Claude Code reads hook exit 2 as "block this tool call".
+    exit 1
+    ;;
+esac
 
 # Unsupported terminals render OSC 6 as literal garbage in the scrollback, so
 # stay silent unless we know we are talking to iTerm2.
@@ -46,101 +121,37 @@ if [ "${TAB_STATE_FORCE:-}" != 1 ] &&
   exit 0
 fi
 
-# tmux/screen swallow OSC 6 unless passthrough is enabled, and the escape would
-# reach the multiplexer rather than the tab. Opt in explicitly.
-if [ -n "${TMUX:-}${STY:-}" ] && [ "${TAB_STATE_TMUX:-}" != 1 ]; then
+# Under tmux/screen the escape reaches the multiplexer, not the tab. Passthrough
+# wrapping was tried and removed: every pane shares one iTerm2 tab, so the
+# signal cannot mean what it means everywhere else.
+[ -n "${TMUX:-}${STY:-}" ] && exit 0
+
+# Feature off: clear anything we painted and get out. Deliberately above
+# resolve_dev, which is the most expensive thing this script does and is pure
+# waste for a disabled feature. Fork-free once the registry has been drained.
+if [ -e "$DISABLE_FLAG" ]; then
+  for f in "$STATE_DIR"/tty-*; do
+    [ -e "$f" ] || continue
+    read -r d 2>/dev/null <"$f" || continue
+    [ -w "$d" ] && printf '%b' "$RESET_SEQ" >"$d" 2>/dev/null
+    rm -f "$f" 2>/dev/null
+  done
   exit 0
 fi
-
-# Resolve the owning tty by walking $PPID up the process tree. One ps snapshot
-# plus one awk pass: O(procs) work but O(1) forks, versus two forks per level.
-# This runs on every PostToolUse, so the fork count matters.
-resolve_dev() {
-  local name
-  name=$(ps -axo pid=,ppid=,tty= 2>/dev/null | awk -v start="$PPID" '
-    { ppid[$1] = $2; tty[$1] = $3 }
-    END {
-      p = start
-      # Cap the climb so a cycle or a bogus table cannot spin forever.
-      for (i = 0; i < 32; i++) {
-        if (p == "" || p == "0") break
-        if (tty[p] ~ /^ttys/) { print tty[p]; exit }
-        p = ppid[p]
-      }
-    }')
-  [ -n "$name" ] && printf '/dev/%s' "$name"
-}
 
 dev="${TAB_STATE_DEV:-$(resolve_dev)}"
 [ -n "$dev" ] && [ -w "$dev" ] || exit 0
 
 STOP_MARKER="${STATE_DIR}/stopped-${dev##*/}"
-TTY_REGISTRY="${STATE_DIR}/ttys"
-
-emit() { # $1 = one or more OSC sequences, as literal \033...\007 text
-  local seq="$1"
-  if [ -n "${TMUX:-}" ]; then
-    # tmux passthrough: wrap in DCS and double every ESC in the payload.
-    # Needs `set -g allow-passthrough on` in the tmux config.
-    seq="\033Ptmux;$(printf '%s' "$seq" | sed 's/\\033/\\033\\033/g')\033\\\\"
-  fi
-  printf '%b' "$seq" >"$dev" 2>/dev/null
-}
-
-set_color() { # r g b
-  emit "\033]6;1;bg;red;brightness;$1\007\033]6;1;bg;green;brightness;$2\007\033]6;1;bg;blue;brightness;$3\007"
-}
-reset_color() { emit "\033]6;1;bg;*;default\007"; }
-
-# Disabled -> ensure the tab is back to default and stop.
-if [ -e "$DISABLE_FLAG" ]; then
-  reset_color
-  exit 0
-fi
-
 [ -d "$STATE_DIR" ] || mkdir -p "$STATE_DIR" 2>/dev/null
 
-# Record this tty so `toggle.sh off` can clear every tab we have ever colored,
-# not just the current one. Read in bash to keep the hot path fork-free.
-register_tty() {
-  local line
-  if [ -e "$TTY_REGISTRY" ]; then
-    while IFS= read -r line; do
-      [ "$line" = "$dev" ] && return 0
-    done <"$TTY_REGISTRY"
-  fi
-  printf '%s\n' "$dev" >>"$TTY_REGISTRY" 2>/dev/null
-}
-
-# True if a reset landed in the last couple of seconds. Parallel tool calls can
-# deliver a PostToolUse green *after* Stop's reset, which would strand the tab
-# green; `start` clears the marker so a genuine new turn is never suppressed.
-stop_is_recent() {
-  [ -e "$STOP_MARKER" ] || return 1
-  local now mtime
-  now=$(date +%s 2>/dev/null) || return 1
-  mtime=$(stat -f %m "$STOP_MARKER" 2>/dev/null) ||
-    mtime=$(stat -c %Y "$STOP_MARKER" 2>/dev/null) || return 1
-  [ $((now - mtime)) -lt 2 ]
-}
-
-# Pull the notification text out of the hook payload. Matching the whole JSON
-# would false-positive on a cwd or file path containing the idle wording.
-notif_message() {
-  if command -v jq >/dev/null 2>&1; then
-    printf '%s' "$1" | jq -r '.message // ""' 2>/dev/null && return 0
-  fi
-  printf '%s' "$1" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
-}
+# ------------------------------------------------------------------- dispatch
 
 case "$state" in
-  start)
-    rm -f "$STOP_MARKER" 2>/dev/null
-    register_tty
-    set_color 0 170 0
-    ;;
-  green)
-    stop_is_recent && exit 0
+  start | green)
+    # `start` reopens the turn; both then paint the same green.
+    [ "$state" = start ] && rm -f "$STOP_MARKER" 2>/dev/null
+    turn_is_closed && exit 0
     register_tty
     set_color 0 170 0
     ;;
@@ -148,19 +159,24 @@ case "$state" in
     # Notification fires for real permission/question prompts AND the idle
     # "waiting for your input" nudge. Only the former marks the tab yellow.
     # Bounded read: an unclosed stdin would otherwise hang until Claude Code's
-    # hook timeout and stall the session.
+    # hook timeout and stall the session, and bash reads byte-at-a-time.
     payload=""
-    [ -t 0 ] || IFS= read -r -d '' -t 2 payload || true
-    # Unparseable payload falls through to yellow — erring toward "tell me".
-    if printf '%s' "$(notif_message "$payload")" | grep -qi 'waiting for your input'; then
-      reset_color
-      exit 0
-    fi
+    [ -t 0 ] || IFS= read -r -d '' -t 2 -n 8192 payload || true
+    notif_message "$payload"
+    # An unparseable payload leaves MSG empty and falls through to yellow —
+    # erring toward "tell me".
+    shopt -s nocasematch
+    case "$MSG" in
+      *'waiting for your input'*)
+        reset_color
+        exit 0
+        ;;
+    esac
     register_tty
     set_color 235 190 0
     ;;
   reset)
-    : >"$STOP_MARKER" 2>/dev/null
+    date +%s >"$STOP_MARKER" 2>/dev/null
     reset_color
     ;;
 esac
