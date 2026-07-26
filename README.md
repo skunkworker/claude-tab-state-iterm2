@@ -31,9 +31,10 @@ hook block into `~/.claude/settings.json`. It backs the file up first, claims
 only the exact commands it generates, and leaves every other hook alone — so
 re-running it is safe and never stacks duplicates.
 
-Needs Claude Code **2.0.43 or newer** for the `SubagentStart` event and the
-`agent_id` hook field. On older versions everything except the blue subagent
-state still works.
+The blue subagent state needs Claude Code **2.0.43 or newer** (`SubagentStart`
+and the `agent_id` hook field). `install.sh` checks `claude --version` and
+simply leaves those two events unwired on anything older; every other color
+still works.
 
 ```sh
 ./install.sh --dry-run     # show what would change, touch nothing
@@ -153,7 +154,8 @@ almost nothing per tool call.
 ```sh
 tests/run.sh           # run everything
 tests/run.sh install   # run tests whose name matches "install"
-shellcheck *.sh tests/*.sh
+shellcheck --severity=style *.sh tests/*.sh
+shfmt -d .             # flagless: takes its settings from .editorconfig
 ```
 
 Tests drive the scripts through env seams rather than a real terminal:

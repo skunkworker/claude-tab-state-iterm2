@@ -3,6 +3,33 @@
 Dated entries, newest first. This is a personal tool with no releases to
 version, so the date something landed is the useful thing to know.
 
+## 2026-07-26 (later)
+
+### Fixed
+
+- Disabling the feature while a subagent was running stranded the tab blue.
+  The disabled fast path exits before the subagent bookkeeping, so it swallowed
+  the `SubagentStop` that would have cleared the token; re-enabling then showed
+  "waiting for subagents" for an agent that had long finished, until the 2h
+  staleness sweep. Both `toggle.sh off` and the disabled path now drain them.
+- `install.sh` followed a symlinked `settings.json` — the atomic write replaced
+  the link itself with a regular file, detaching it from its target.
+
+### Changed
+
+- `install.sh` skips `SubagentStart`/`SubagentStop` on Claude Code older than
+  2.0.43 rather than handing an old version an event name it may not know.
+- Session boundaries reap `tty-`/`stopped-` records for ttys that no longer
+  exist. One accumulated per terminal ever used and nothing removed them.
+- `.editorconfig` plus `shfmt -d .` in CI. shfmt reads the indent settings from
+  `.editorconfig`, so CI and your editor cannot drift. Zero reformatting — the
+  existing style already conformed.
+
+### Added
+
+- Tests for all of the above, including stubbed `PATH`s that take `python3` or
+  a specific `claude --version` away: 69 -> 85 assertions.
+
 ## 2026-07-26
 
 ### Added

@@ -36,10 +36,16 @@ enable() {
 }
 
 disable() {
+  local f
   mkdir -p "${HOME}/.claude" 2>/dev/null
   : >"$FLAG"
   echo "tab-state: OFF"
   reset_registered_ttys
+  # Subagent tokens too: while off, tab-state.sh never sees the SubagentStop
+  # that would clear them, so they would strand the tab blue on re-enable.
+  for f in "$STATE_DIR"/agent-* "$STATE_DIR"/stopped-*; do
+    [ -e "$f" ] && rm -f "$f"
+  done
   # The current terminal may not be registered yet (no hook has fired in it).
   { printf '%b' "$RESET_SEQ" >/dev/tty; } 2>/dev/null || true
 }

@@ -118,6 +118,19 @@ sweep_agents() {
   done
 }
 
+# The state dir gains one tty- and one stopped- file per terminal ever used and
+# never loses them on its own. Tiny, but unbounded; session boundaries are rare
+# enough to absorb the sweep. Only records for ttys that are gone are dropped —
+# another live session's tab must keep its own.
+reap_state() {
+  local f dev
+  for f in "$STATE_DIR"/tty-*; do
+    [ -e "$f" ] || continue
+    read -r dev 2>/dev/null <"$f" || continue
+    [ -w "$dev" ] || rm -f "$f" "${STATE_DIR}/stopped-${dev##*/}" 2>/dev/null
+  done
+}
+
 # Busy means green normally, blue while subagents are outstanding.
 paint_busy() {
   register_tty
@@ -173,13 +186,20 @@ fi
 
 # Feature off: clear anything we painted and get out. Deliberately above
 # resolve_dev, which is the most expensive thing this script does and is pure
-# waste for a disabled feature. Fork-free once the registry has been drained.
+# waste for a disabled feature. Fork-free once the state has been drained.
+#
+# Subagent tokens go too. This arm swallows the SubagentStop that would have
+# removed them, so leaving them behind means re-enabling paints blue for an
+# agent that finished while the feature was off.
 if [ -e "$DISABLE_FLAG" ]; then
   for f in "$STATE_DIR"/tty-*; do
     [ -e "$f" ] || continue
     read -r d 2>/dev/null <"$f" || continue
     [ -w "$d" ] && printf '%b' "$RESET_SEQ" >"$d" 2>/dev/null
     rm -f "$f" 2>/dev/null
+  done
+  for f in "$STATE_DIR"/agent-* "$STATE_DIR"/stopped-*; do
+    [ -e "$f" ] && rm -f "$f" 2>/dev/null
   done
   exit 0
 fi
@@ -221,6 +241,7 @@ case "$state" in
   session)
     # A session boundary is the one point where nothing can still be running.
     rm -f "$AGENT_GLOB"* 2>/dev/null
+    reap_state
     date +%s >"$STOP_MARKER" 2>/dev/null
     reset_color
     ;;

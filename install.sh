@@ -80,11 +80,16 @@ remove_link() {
 # Merge in place with python3 (present on any machine with the Xcode CLT).
 # The wiring spec lives here and nowhere else in this script; README.md
 # documents the same table for anyone wiring it by hand.
-merge_hooks() { # mode dry_run
-  python3 - "$SETTINGS" "$1" "$2" <<'PY'
+merge_hooks() { # mode dry_run subagents_supported
+  python3 - "$SETTINGS" "$1" "$2" "$3" <<'PY'
 import json, os, re, shutil, sys
 
 path, mode, dry = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+min_version_ok = sys.argv[4] == "1"
+
+# Follow a symlinked settings.json: os.replace below would otherwise swap the
+# link itself for a regular file and detach it from whatever it pointed at.
+path = os.path.realpath(path)
 
 # (event, matcher, state). PreToolUse matters as much as PostToolUse: without
 # it the tab stays yellow for the whole duration of a long tool call you just
@@ -146,7 +151,13 @@ for event in scope:
         del hooks[event]
 
 if mode == "install":
-    for event, matcher, state in SPEC:
+    wiring = SPEC
+    if not min_version_ok:
+        # SubagentStart arrived in 2.0.43. What an older Claude Code does with
+        # an unknown hook event is untested here, so do not hand it one.
+        wiring = [s for s in SPEC if not s[0].startswith("Subagent")]
+        note("skipping SubagentStart/SubagentStop (needs Claude Code 2.0.43+)")
+    for event, matcher, state in wiring:
         entry = {"type": "command", "command": "bash ~/.claude/tab-state.sh %s" % state}
         group = {"hooks": [entry]}
         if matcher:
@@ -176,13 +187,35 @@ os.replace(tmp, path)
 PY
 }
 
+# The blue subagent state needs SubagentStart (Claude Code 2.0.43). Assume a
+# new enough version when `claude` is absent — someone installing this without
+# the binary on PATH is wiring a machine they know better than we do.
+version_supports_subagents() {
+  local v major minor patch
+  command -v claude >/dev/null 2>&1 || return 0
+  v=$(claude --version 2>/dev/null) || return 0
+  v=${v%% *}
+  case "$v" in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) return 0 ;;
+  esac
+  IFS=. read -r major minor patch <<<"$v"
+  [ "$major" -gt 2 ] && return 0
+  [ "$major" -lt 2 ] && return 1
+  [ "$minor" -gt 0 ] && return 0
+  [ "$patch" -ge 43 ]
+}
+
 install_hooks() {
   if ! command -v python3 >/dev/null 2>&1; then
-    say "hooks: python3 not found — see the manual wiring block in README.md"
+    say "hooks: python3 not found — add the wiring block from README.md to"
+    say "       $SETTINGS by hand, then run /hooks."
     return 1
   fi
+  local subagents=0
+  version_supports_subagents && subagents=1
   say "hooks:"
-  merge_hooks "$1" "$DRY_RUN"
+  merge_hooks "$1" "$DRY_RUN" "$subagents"
 }
 
 # ------------------------------------------------------------------- driver

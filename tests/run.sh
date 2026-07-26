@@ -283,6 +283,43 @@ if it "the disable flag clears painted tabs and drains the registry"; then
   check "$CURRENT (drained)" "absent" "$(exists "$REGISTRY")"
 fi
 
+if it "disabling forgets outstanding subagents"; then
+  # While off, the SubagentStop that would clear a token never reaches us, so
+  # keeping tokens would strand the tab blue on re-enable.
+  "$TAB_STATE" start
+  agent agent-start ag_one
+  : >"$DISABLED"
+  "$TAB_STATE" green
+  check "$CURRENT (drained)" "0" "$(find "$STATE_DIR" -name 'agent-*' | wc -l | tr -d ' ')"
+  rm -f "$DISABLED"
+  "$TAB_STATE" start
+  clear_out
+  "$TAB_STATE" green
+  check "$CURRENT (green after re-enable)" "$GREEN" "$(out)"
+fi
+
+if it "toggle off forgets outstanding subagents"; then
+  "$TAB_STATE" start
+  agent agent-start ag_one
+  "$TOGGLE" off >/dev/null 2>&1
+  check "$CURRENT (drained)" "0" "$(find "$STATE_DIR" -name 'agent-*' | wc -l | tr -d ' ')"
+  "$TOGGLE" on >/dev/null 2>&1
+  "$TAB_STATE" start
+  clear_out
+  "$TAB_STATE" green
+  check "$CURRENT (green after re-enable)" "$GREEN" "$(out)"
+fi
+
+if it "session reaps records for ttys that are gone"; then
+  "$TAB_STATE" green
+  echo "$SANDBOX/vanished" >"$STATE_DIR/tty-vanished"
+  : >"$STATE_DIR/stopped-vanished"
+  "$TAB_STATE" session
+  check "$CURRENT (dead tty gone)" "absent" "$(exists "$STATE_DIR/tty-vanished")"
+  check "$CURRENT (its marker gone)" "absent" "$(exists "$STATE_DIR/stopped-vanished")"
+  check "$CURRENT (live tty kept)" "present" "$(exists "$REGISTRY")"
+fi
+
 if it "the disable flag stays silent once nothing is painted"; then
   : >"$DISABLED"
   "$TAB_STATE" green
@@ -495,6 +532,66 @@ if it "uninstall removes only our entries"; then
   check "$CURRENT (ours)" "0" "$(count_hooks tab-state.sh)"
   check "$CURRENT (foreign)" "1" "$(count_hooks unrelated-tool)"
   check "$CURRENT (symlink)" "absent" "$(exists "$HOME/.claude/tab-state.sh")"
+fi
+
+# A dir of symlinks to the tools install.sh needs, minus the ones named. Lets a
+# test take a single binary away without breaking the rest of the script.
+stub_path_without() { # tool...
+  local keep drop=" $* " bin="$SANDBOX/stubbin" p
+  mkdir -p "$bin"
+  for keep in mkdir ln chmod readlink rm mv cat python3 claude; do
+    case "$drop" in *" $keep "*) continue ;; esac
+    p=$(command -v "$keep" 2>/dev/null) && ln -sf "$p" "$bin/$keep"
+  done
+  printf '%s' "$bin"
+}
+
+if it "install without python3 explains itself and changes nothing"; then
+  seed_settings
+  before=$(cat "$SETTINGS")
+  PATH="$(stub_path_without python3)" "$INSTALL" >"$SANDBOX/msg" 2>&1
+  check "$CURRENT (exit 1)" "1" "$?"
+  check "$CURRENT (untouched)" "$before" "$(cat "$SETTINGS")"
+  check "$CURRENT (points at README)" "yes" \
+    "$(grep -qi 'README' "$SANDBOX/msg" && echo yes || echo no)"
+fi
+
+fake_claude() { # version -> a PATH with that `claude` in front
+  local bin="$SANDBOX/fakebin"
+  mkdir -p "$bin"
+  printf '#!/bin/bash\necho "%s (Claude Code)"\n' "$1" >"$bin/claude"
+  chmod +x "$bin/claude"
+  printf '%s:%s' "$bin" "$PATH"
+}
+
+if it "install skips the subagent events on Claude Code older than 2.0.43"; then
+  seed_settings
+  PATH="$(fake_claude 2.0.42)" "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT (skipped)" "0" "$(count_hooks agent-start)"
+  check "$CURRENT (rest wired)" "8" "$(count_hooks tab-state.sh)"
+fi
+
+if it "install wires the subagent events on 2.0.43 and newer"; then
+  seed_settings
+  PATH="$(fake_claude 2.0.43)" "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT (2.0.43)" "1" "$(count_hooks agent-start)"
+  seed_settings
+  PATH="$(fake_claude 3.1.0)" "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT (3.1.0)" "1" "$(count_hooks agent-start)"
+fi
+
+if it "install follows a symlinked settings.json"; then
+  real="$SANDBOX/real-settings.json"
+  seed_settings
+  mv "$SETTINGS" "$real"
+  ln -s "$real" "$SETTINGS"
+  "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT (still a link)" "$real" "$(readlink "$SETTINGS")"
+  check "$CURRENT (target rewritten)" "10" \
+    "$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print(sum(1 for gs in d.get("hooks",{}).values() for g in gs
+          for h in g["hooks"] if "tab-state.sh" in h["command"]))' "$real")"
 fi
 
 if it "install rejects an unknown option"; then
