@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - run: shellcheck --severity=style tab-state.sh toggle.sh install.sh tests/run.sh
+      - run: shellcheck --severity=style ./*.sh tests/*.sh
 
   test:
     # macOS is the real target; ubuntu catches accidental BSD-only assumptions.

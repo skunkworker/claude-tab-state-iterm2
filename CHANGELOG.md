@@ -40,6 +40,10 @@
   `--uninstall`.
 - `tests/run.sh` — 69 assertions driven through env seams rather than a real
   terminal.
+- `tests/probe-hooks.sh` — verifies the hook contract against the installed
+  Claude Code by running a real session in a sandboxed temp dir. Catches the
+  failure the unit tests structurally cannot: Claude Code changing what it
+  sends. Manual, not in CI — it needs the `claude` binary and spends tokens.
 - CI (shellcheck, plus the suite on macOS and Ubuntu), `LICENSE`, `.gitignore`.
 
 ### Changed

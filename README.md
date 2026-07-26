@@ -153,7 +153,7 @@ almost nothing per tool call.
 ```sh
 tests/run.sh           # run everything
 tests/run.sh install   # run tests whose name matches "install"
-shellcheck *.sh tests/run.sh
+shellcheck *.sh tests/*.sh
 ```
 
 Tests drive the scripts through env seams rather than a real terminal:
@@ -161,12 +161,29 @@ Tests drive the scripts through env seams rather than a real terminal:
 iTerm2 detection, and `HOME` points at a sandbox so flag files, stop markers and
 the tty registry never touch your real `~/.claude`.
 
+That suite proves the scripts behave; it cannot prove Claude Code still sends
+what they expect. For that:
+
+```sh
+tests/probe-hooks.sh   # verify the hook contract against installed Claude Code
+```
+
+It starts a real Claude Code session in a temp dir with its own `--settings`
+(so it needs the `claude` binary and spends tokens — hence not in CI), then
+checks that `SubagentStart`/`SubagentStop` fire, that both carry `agent_id`,
+that **the two ids agree** — tokens would leak and the tab would stick blue if
+they ever stopped — and that `tab-state.sh` still parses the payloads as
+actually shipped rather than as fixtured. Worth running when you upgrade
+Claude Code.
+
 ## Files
 
 - `tab-state.sh` — the worker; `~/.claude/tab-state.sh` symlinks to it.
 - `toggle.sh` — enable/disable the feature.
 - `install.sh` — symlink + hook wiring.
 - `tests/run.sh` — the test suite.
+- `tests/probe-hooks.sh` — verifies the hook contract against installed Claude
+  Code. Manual; needs the `claude` binary.
 
 ## License
 
