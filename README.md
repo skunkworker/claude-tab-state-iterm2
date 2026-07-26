@@ -6,24 +6,68 @@ or idle.
 
 | Tab color | Meaning | Hook event |
 |-----------|---------|------------|
-| 🟢 green  | Claude is running | `UserPromptSubmit`, `PostToolUse` |
+| 🟢 green  | Claude is running | `UserPromptSubmit`, `PreToolUse`, `PostToolUse` |
 | 🟡 yellow | Claude needs you (permission / question) | `Notification` |
-| default   | done / idle | `Stop` |
+| default   | done / idle / session over | `Stop`, `SessionEnd`, `SessionStart` |
 
-## Files
+## Install
 
-- `tab-state.sh` — the worker. Source of truth. `~/.claude/tab-state.sh` is a
-  symlink to this file, so edits here are live.
-- `toggle.sh` — enable/disable the feature.
-- `README.md` — this file.
+```sh
+git clone https://github.com/skunkworker/claude-tab-state-iterm2
+cd claude-tab-state-iterm2
+./install.sh
+```
+
+Then run `/hooks` in Claude Code (or restart it) to load the wiring.
+
+`install.sh` symlinks `tab-state.sh` to `~/.claude/tab-state.sh` and merges the
+hook block into `~/.claude/settings.json`. It backs the file up first, only
+touches entries that mention `tab-state.sh`, and leaves every other hook alone —
+so re-running it is safe and never stacks duplicates.
+
+```sh
+./install.sh --dry-run     # show what would change, touch nothing
+./install.sh --no-hooks    # symlink only, edit settings.json yourself
+./install.sh --uninstall   # remove the symlink and our hook entries
+```
+
+If you would rather wire it by hand, add this to `~/.claude/settings.json`:
+
+```json
+"hooks": {
+  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh start" }] }],
+  "PreToolUse":       [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh green" }] }],
+  "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh green" }] }],
+  "Notification":     [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh yellow" }] }],
+  "Stop":             [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh reset" }] }],
+  "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh reset" }] }],
+  "SessionStart":     [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh reset" }] }]
+}
+```
+
+Editing `tab-state.sh` needs no reload — it is read fresh on every hook call.
+Only changing the wiring above requires `/hooks`.
+
+## Toggle
+
+```sh
+./toggle.sh          # flip on/off
+./toggle.sh off      # force off
+./toggle.sh on       # force on
+./toggle.sh status   # show state
+```
+
+`off` drops `~/.claude/tab-state.disabled` and immediately clears every tab the
+script has ever colored. While the flag exists, each hook call just resets the
+tab instead of signaling.
 
 ## How it works
 
-- **Tab color, not title.** Uses iTerm2's tab-color escape (`OSC 6 ;1;bg`).
+- **Tab color, not title.** Uses iTerm2's tab-color escape (`OSC 6;1;bg`).
   It's a dedicated channel — Claude Code never writes tab color — so nothing
-  competes with it and the reset (`6;1;bg;*;default`) is reliable. With
-  multiple tabs the color stays in the individual tab cell. The tab *title* is
-  left untouched, so Claude's own topic titles are preserved.
+  competes with it and the reset (`6;1;bg;*;default`) is reliable. With multiple
+  tabs the color stays in the individual tab cell. The tab *title* is left
+  untouched, so Claude's own topic titles are preserved.
   - Tab *title* signaling (a 🟢/🟡 emoji in the title) was tried first but is
     less reliable: Claude Code also writes the title, so the two fight and the
     marker flickers/persists. Title-only is better if you usually run a single
@@ -34,50 +78,66 @@ or idle.
   version "never changed colors"). The script walks up the process tree from
   `$PPID` to the parent `claude` process and writes to its real `/dev/ttysNNN`.
   Each session resolves its own tty, so multiple instances color the right tab.
+  The walk uses a single `ps` snapshot because it runs on every `PostToolUse`.
 
 - **Idle vs. real prompts.** The `Notification` event fires both for genuine
   permission/question prompts **and** for the idle "Claude is waiting for your
   input" nudge (~60s after a turn ends). The script reads the notification
-  message from stdin and only turns the tab yellow for the former; the idle
-  nudge resets instead.
+  payload's `message` field and only turns the tab yellow for the former; the
+  idle nudge resets instead. A payload it cannot parse is treated as a real
+  prompt — better a spurious yellow than a missed one.
 
-## Wiring (in `~/.claude/settings.json`)
+- **Not getting stuck.** `Stop` does not fire when you interrupt, quit, or
+  crash, which used to leave the tab green with nothing behind it — hence
+  `SessionEnd`. And with parallel tool calls a slow `PostToolUse` green can
+  land *after* `Stop`'s reset, so `reset` drops a marker that suppresses green
+  for the next two seconds; `start` clears it so a genuine new turn always
+  paints.
 
-```json
-"hooks": {
-  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh green" }] }],
-  "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh green" }] }],
-  "Notification":     [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh yellow" }] }],
-  "Stop":             [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh reset" }] }]
-}
-```
+- **Why `PreToolUse` too.** `PostToolUse` fires when a tool *finishes*. Without
+  `PreToolUse`, approving a three-minute test run leaves the tab yellow for the
+  whole run, claiming it needs you when it doesn't.
 
-After editing `settings.json`, reload with `/hooks` (or restart Claude Code).
-Editing `tab-state.sh` needs no reload — it's read fresh on every hook call.
+## Requirements and limits
 
-## Toggle
-
-```sh
-~/dev/ai_tools/claude-tab-state/toggle.sh          # flip on/off
-~/dev/ai_tools/claude-tab-state/toggle.sh off      # force off
-~/dev/ai_tools/claude-tab-state/toggle.sh on       # force on
-~/dev/ai_tools/claude-tab-state/toggle.sh status   # show state
-```
-
-`off` drops `~/.claude/tab-state.disabled`. While it exists, every hook call
-just resets the tab to default instead of signaling, so no tab stays colored.
+- **macOS + iTerm2.** The script checks `LC_TERMINAL` / `TERM_PROGRAM` and stays
+  silent elsewhere, because terminals without OSC 6 support render the escape as
+  literal garbage in the scrollback. Set `TAB_STATE_FORCE=1` to override.
+- **tmux / screen are off by default.** The escape reaches the multiplexer
+  rather than the tab. Set `TAB_STATE_TMUX=1` to wrap it in tmux's DCS
+  passthrough, which also needs `set -g allow-passthrough on` in your tmux
+  config. Note that all panes share one iTerm2 tab, so the signal is per-window
+  at best.
+- **`jq` is optional.** It is used to read the notification message if present;
+  otherwise a `sed` fallback handles it.
 
 ## Customizing
 
 - **Colors:** edit the `set_color R G B` values in `tab-state.sh` (0–255).
 - **Yellow trigger:** the idle filter matches the string
-  `waiting for your input`; if a future Claude Code version rewords
-  this nudge, update that `grep` pattern.
+  `waiting for your input`; if a future Claude Code version rewords that nudge,
+  update the `grep` pattern.
 
-## Reinstall (e.g. on a new machine)
+## Development
 
 ```sh
-ln -sf ~/dev/ai_tools/claude-tab-state/tab-state.sh ~/.claude/tab-state.sh
-chmod +x ~/dev/ai_tools/claude-tab-state/*.sh
-# then add the hooks block above to ~/.claude/settings.json
+tests/run.sh           # run everything
+tests/run.sh install   # run tests whose name matches "install"
+shellcheck *.sh tests/run.sh
 ```
+
+Tests drive the scripts through env seams rather than a real terminal:
+`TAB_STATE_DEV` redirects the escapes into a file, `TAB_STATE_FORCE=1` skips
+iTerm2 detection, and `HOME` points at a sandbox so flag files, stop markers and
+the tty registry never touch your real `~/.claude`.
+
+## Files
+
+- `tab-state.sh` — the worker; `~/.claude/tab-state.sh` symlinks to it.
+- `toggle.sh` — enable/disable the feature.
+- `install.sh` — symlink + hook wiring.
+- `tests/run.sh` — the test suite.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
