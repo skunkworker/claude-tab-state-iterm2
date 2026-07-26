@@ -325,6 +325,117 @@ if it "toggle rejects an unknown subcommand"; then
   teardown
 fi
 
+# -------------------------------------------------------------------- install.sh
+
+INSTALL="$ROOT/install.sh"
+
+# settings.json with an unrelated hook plus the old-style wiring, so we can
+# assert the merge is surgical.
+seed_settings() {
+  cat >"$HOME/.claude/settings.json" <<'JSON'
+{
+  "model": "opus",
+  "hooks": {
+    "PreToolUse": [{"matcher":"Bash","hooks":[{"type":"command","command":"rtk hook claude"}]}],
+    "UserPromptSubmit": [{"hooks":[{"type":"command","command":"bash ~/.claude/tab-state.sh green"}]}],
+    "Stop": [{"hooks":[{"type":"command","command":"bash ~/.claude/tab-state.sh reset"}]}]
+  }
+}
+JSON
+}
+
+settings_query() { python3 -c "$1" "$HOME/.claude/settings.json"; }
+
+COUNT_OURS='import json,sys
+d=json.load(open(sys.argv[1]))
+print(sum(1 for gs in d.get("hooks",{}).values() for g in gs for h in g["hooks"] if "tab-state.sh" in h["command"]))'
+COUNT_FOREIGN='import json,sys
+d=json.load(open(sys.argv[1]))
+print(sum(1 for gs in d.get("hooks",{}).values() for g in gs for h in g["hooks"] if "rtk" in h["command"]))'
+
+if it "install wires every event"; then
+  setup
+  seed_settings
+  "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT" "7" "$(settings_query "$COUNT_OURS")"
+  teardown
+fi
+
+if it "install preserves unrelated settings and hooks"; then
+  setup
+  seed_settings
+  "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT (model)" "opus" "$(settings_query 'import json,sys; print(json.load(open(sys.argv[1]))["model"])')"
+  check "$CURRENT (foreign hook)" "1" "$(settings_query "$COUNT_FOREIGN")"
+  teardown
+fi
+
+if it "install is idempotent"; then
+  setup
+  seed_settings
+  "$INSTALL" >/dev/null 2>&1
+  "$INSTALL" >/dev/null 2>&1
+  "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT (ours)" "7" "$(settings_query "$COUNT_OURS")"
+  check "$CURRENT (foreign)" "1" "$(settings_query "$COUNT_FOREIGN")"
+  teardown
+fi
+
+if it "install --dry-run writes nothing"; then
+  setup
+  seed_settings
+  before=$(cat "$HOME/.claude/settings.json")
+  "$INSTALL" --dry-run >/dev/null 2>&1
+  check "$CURRENT (settings)" "$before" "$(cat "$HOME/.claude/settings.json")"
+  check "$CURRENT (symlink)" "absent" "$([ -e "$HOME/.claude/tab-state.sh" ] && echo present || echo absent)"
+  teardown
+fi
+
+if it "install replaces a drifted regular-file copy with a symlink"; then
+  setup
+  cp "$TAB_STATE" "$HOME/.claude/tab-state.sh"
+  "$INSTALL" --no-hooks >/dev/null 2>&1
+  check "$CURRENT (link)" "$TAB_STATE" "$(readlink "$HOME/.claude/tab-state.sh")"
+  check "$CURRENT (backup)" "present" "$([ -e "$HOME/.claude/tab-state.sh.bak" ] && echo present || echo absent)"
+  teardown
+fi
+
+if it "install backs settings up before rewriting"; then
+  setup
+  seed_settings
+  before=$(cat "$HOME/.claude/settings.json")
+  "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT" "$before" "$(cat "$HOME/.claude/settings.json.bak")"
+  teardown
+fi
+
+if it "install refuses to touch malformed settings"; then
+  setup
+  echo '{ broken' >"$HOME/.claude/settings.json"
+  "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT (exit 1)" "1" "$?"
+  check "$CURRENT (untouched)" "{ broken" "$(cat "$HOME/.claude/settings.json")"
+  teardown
+fi
+
+if it "uninstall removes only our entries"; then
+  setup
+  seed_settings
+  "$INSTALL" >/dev/null 2>&1
+  "$INSTALL" --uninstall >/dev/null 2>&1
+  check "$CURRENT (ours)" "0" "$(settings_query "$COUNT_OURS")"
+  check "$CURRENT (foreign)" "1" "$(settings_query "$COUNT_FOREIGN")"
+  check "$CURRENT (symlink)" "absent" "$([ -e "$HOME/.claude/tab-state.sh" ] && echo present || echo absent)"
+  teardown
+fi
+
+if it "install rejects an unknown option"; then
+  setup
+  "$INSTALL" --nope >/dev/null 2>&1
+  check "$CURRENT: exit 2" "2" "$?"
+  teardown
+fi
+
 # ------------------------------------------------------------------------ result
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
