@@ -1,11 +1,14 @@
 #!/bin/bash
 # Reflect Claude Code state in the iTerm2 tab via the native TAB COLOR.
-# Usage: tab-state.sh {start|green|yellow|reset}
+# Usage: tab-state.sh {start|green|yellow|reset|session|agent-start|agent-stop}
 #
-#   start  = a new turn began (opens the turn, then paints green)
-#   green  = Claude is running
-#   yellow = Claude needs you (real permission/question prompt)
-#   reset  = default tab color (Claude is done / idle / session over)
+#   start        = a new turn began (opens the turn, then paints busy)
+#   green        = Claude is running
+#   yellow       = Claude needs you (permission / question prompt)
+#   reset        = turn over (Stop)
+#   session      = session boundary; also forgets any tracked subagents
+#   agent-start  = a subagent was dispatched
+#   agent-stop   = a subagent finished
 #
 # Installed from github.com/skunkworker/claude-tab-state-iterm2.
 #
@@ -36,6 +39,11 @@ STATE_DIR="${HOME:-}/.claude/.tab-state"
 # many seconds. It only has to outlast scheduling skew between two hook
 # subprocesses, so it is deliberately far larger than that rather than tuned.
 STALE_AFTER=60
+
+# Backstop for a subagent whose SubagentStop never arrives (it errored, or the
+# session died). Generous: a long research subagent must not be swept while it
+# is still working. Session boundaries drain the whole set anyway.
+AGENT_STALE_AFTER=7200
 
 # ------------------------------------------------------------------ functions
 
@@ -69,7 +77,7 @@ reset_color() { emit "$RESET_SEQ"; }
 
 # One file per tty rather than one shared list: registration is an idempotent
 # write with no read, no dedupe, and no interleaving between the parallel hook
-# processes that can run at once. Matches how the stop marker is keyed.
+# processes that can run at once. Matches how the other records are keyed.
 register_tty() { printf '%s\n' "$dev" >"${STATE_DIR}/tty-${dev##*/}" 2>/dev/null; }
 
 # True while the turn is closed. `reset` closes it, `start` reopens it — a
@@ -86,29 +94,66 @@ turn_is_closed() {
   [ $((now - stamped)) -lt "$STALE_AFTER" ]
 }
 
-# Pull the notification text out of the payload without forking. jq would cost
-# two processes on the one path where a human is actively waiting, and neither
-# it nor a sed fallback is worth that here: this is a substring test, not a
-# parse. Like the sed version, it does not unescape JSON strings.
-notif_message() { # -> MSG
-  local m=$1
-  MSG=""
+# One token file per outstanding subagent, keyed by the agent_id that both
+# SubagentStart and SubagentStop carry. Counting in a shared file would be a
+# read-modify-write race between the hook processes of agents that start and
+# finish concurrently; a glob has no such problem and needs no locking.
+agents_running() { # fork-free: the hot path only asks "any?"
+  local f
+  for f in "$AGENT_GLOB"*; do
+    [ -e "$f" ] && return 0
+    break
+  done
+  return 1
+}
+
+# Swept only on the rare agent events, never on the hot path.
+sweep_agents() {
+  local f stamped now
+  now=$(date +%s) || return 0
+  for f in "$AGENT_GLOB"*; do
+    [ -e "$f" ] || continue
+    read -r stamped 2>/dev/null <"$f" || stamped=0
+    [ $((now - ${stamped:-0})) -ge "$AGENT_STALE_AFTER" ] && rm -f "$f" 2>/dev/null
+  done
+}
+
+# Busy means green normally, blue while subagents are outstanding.
+paint_busy() {
+  register_tty
+  if agents_running; then
+    set_color 0 150 200
+  else
+    set_color 0 170 0
+  fi
+}
+
+read_payload() { # -> PAYLOAD
+  # Bounded read: an unclosed stdin would otherwise hang until Claude Code's
+  # hook timeout and stall the session, and bash reads byte-at-a-time.
+  PAYLOAD=""
+  [ -t 0 ] || IFS= read -r -d '' -t 2 -n 8192 PAYLOAD || true
+}
+
+json_field() { # name -> FIELD, from $PAYLOAD, without forking
+  local key="\"$1\"" m=$PAYLOAD
+  FIELD=""
   case "$m" in
-    *'"message"'*) ;;
+    *"$key"*) ;;
     *) return 0 ;;
   esac
-  m=${m#*'"message"'}
+  m=${m#*"$key"}
   m=${m#*:}
-  m=${m#*'"'}
-  MSG=${m%%'"'*}
+  m=${m#*\"}
+  FIELD=${m%%\"*}
 }
 
 # ------------------------------------------------------- guards, cheapest first
 
 case "${1:-}" in
-  start | green | yellow | reset) state="$1" ;;
+  start | green | yellow | reset | session | agent-start | agent-stop) state="$1" ;;
   *)
-    echo "usage: tab-state.sh {start|green|yellow|reset}" >&2
+    echo "usage: tab-state.sh {start|green|yellow|reset|session|agent-start|agent-stop}" >&2
     # Exit 1, never 2: Claude Code reads hook exit 2 as "block this tool call".
     exit 1
     ;;
@@ -143,41 +188,66 @@ dev="${TAB_STATE_DEV:-$(resolve_dev)}"
 [ -n "$dev" ] && [ -w "$dev" ] || exit 0
 
 STOP_MARKER="${STATE_DIR}/stopped-${dev##*/}"
+AGENT_GLOB="${STATE_DIR}/agent-${dev##*/}-"
 [ -d "$STATE_DIR" ] || mkdir -p "$STATE_DIR" 2>/dev/null
 
 # ------------------------------------------------------------------- dispatch
 
 case "$state" in
   start | green)
-    # `start` reopens the turn; both then paint the same green.
+    # `start` reopens the turn; both then paint the same busy color.
     [ "$state" = start ] && rm -f "$STOP_MARKER" 2>/dev/null
     turn_is_closed && exit 0
-    register_tty
-    set_color 0 170 0
+    paint_busy
     ;;
   yellow)
-    # Notification fires for real permission/question prompts AND the idle
-    # "waiting for your input" nudge. Only the former marks the tab yellow.
-    # Bounded read: an unclosed stdin would otherwise hang until Claude Code's
-    # hook timeout and stall the session, and bash reads byte-at-a-time.
-    payload=""
-    [ -t 0 ] || IFS= read -r -d '' -t 2 -n 8192 payload || true
-    notif_message "$payload"
-    # An unparseable payload leaves MSG empty and falls through to yellow —
-    # erring toward "tell me".
-    shopt -s nocasematch
-    case "$MSG" in
-      *'waiting for your input'*)
-        reset_color
-        exit 0
-        ;;
-    esac
+    # Wired to Notification's `permission_prompt` matcher, so the idle nudge
+    # never reaches this arm and no payload parsing is needed to tell them
+    # apart. `idle_prompt` is wired to `reset` instead.
     register_tty
     set_color 235 190 0
     ;;
   reset)
     date +%s >"$STOP_MARKER" 2>/dev/null
+    # Subagents outlive the turn that dispatched them, so a finished turn with
+    # work still outstanding stays blue rather than going dark.
+    if agents_running; then
+      register_tty
+      set_color 0 150 200
+    else
+      reset_color
+    fi
+    ;;
+  session)
+    # A session boundary is the one point where nothing can still be running.
+    rm -f "$AGENT_GLOB"* 2>/dev/null
+    date +%s >"$STOP_MARKER" 2>/dev/null
     reset_color
+    ;;
+  agent-start)
+    read_payload
+    json_field agent_id
+    [ -n "$FIELD" ] || exit 0
+    sweep_agents
+    date +%s >"${AGENT_GLOB}${FIELD//[^A-Za-z0-9_-]/_}" 2>/dev/null
+    register_tty
+    set_color 0 150 200
+    ;;
+  agent-stop)
+    read_payload
+    json_field agent_id
+    [ -n "$FIELD" ] || exit 0
+    rm -f "${AGENT_GLOB}${FIELD//[^A-Za-z0-9_-]/_}" 2>/dev/null
+    sweep_agents
+    # Hand the tab back to whatever the turn is actually doing.
+    if agents_running; then
+      register_tty
+      set_color 0 150 200
+    elif turn_is_closed; then
+      reset_color
+    else
+      paint_busy
+    fi
     ;;
 esac
 exit 0

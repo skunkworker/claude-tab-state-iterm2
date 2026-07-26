@@ -25,6 +25,7 @@ ESC=$'\033'
 BEL=$'\007'
 GREEN="${ESC}]6;1;bg;red;brightness;0${BEL}${ESC}]6;1;bg;green;brightness;170${BEL}${ESC}]6;1;bg;blue;brightness;0${BEL}"
 YELLOW="${ESC}]6;1;bg;red;brightness;235${BEL}${ESC}]6;1;bg;green;brightness;190${BEL}${ESC}]6;1;bg;blue;brightness;0${BEL}"
+BLUE="${ESC}]6;1;bg;red;brightness;0${BEL}${ESC}]6;1;bg;green;brightness;150${BEL}${ESC}]6;1;bg;blue;brightness;200${BEL}"
 DEFAULT="${ESC}]6;1;bg;*;default${BEL}"
 
 setup() {
@@ -85,7 +86,8 @@ it() {
 if it "rejects a missing argument"; then
   err=$("$TAB_STATE" 2>&1 >/dev/null)
   check "$CURRENT: exit 1" "1" "$?"
-  check "$CURRENT: prints usage" "usage: tab-state.sh {start|green|yellow|reset}" "$err"
+  check "$CURRENT: prints usage" \
+    "usage: tab-state.sh {start|green|yellow|reset|session|agent-start|agent-stop}" "$err"
 fi
 
 if it "rejects an unknown state"; then
@@ -115,23 +117,18 @@ fi
 
 # ------------------------------------------------------------ notification path
 
-yellow_case() { # name payload expected
-  it "$1" || return 0
-  printf '%s' "$2" | "$TAB_STATE" yellow
-  check "$CURRENT" "$3" "$(out)"
-}
-yellow_case "yellow paints a real permission prompt" \
-  '{"message":"Claude needs your permission to use Bash"}' "$YELLOW"
-yellow_case "yellow resets on the idle nudge" \
-  '{"message":"Claude is waiting for your input"}' "$DEFAULT"
-yellow_case "yellow matches the nudge case-insensitively" \
-  '{"message":"Claude is WAITING FOR YOUR INPUT"}' "$DEFAULT"
-yellow_case "yellow ignores the idle wording outside the message field" \
-  '{"cwd":"/tmp/waiting for your input","message":"needs your permission"}' "$YELLOW"
-yellow_case "yellow defaults to alerting on an unparseable payload" \
-  'not json at all' "$YELLOW"
+# The permission_prompt / idle_prompt matchers do the splitting now, so yellow
+# paints unconditionally and reads no payload at all. The idle nudge is wired
+# to `reset` and is covered by the reset tests.
+if it "yellow paints regardless of the payload"; then
+  echo '{"message":"Claude is waiting for your input"}' | "$TAB_STATE" yellow
+  check "$CURRENT (ignores stdin)" "$YELLOW" "$(out)"
+  clear_out
+  "$TAB_STATE" yellow </dev/null
+  check "$CURRENT (no stdin)" "$YELLOW" "$(out)"
+fi
 
-if it "yellow does not hang on an open stdin"; then
+if it "agent events do not hang on an open stdin"; then
   # A fifo held open by a slow writer. It must be a fifo rather than a pipeline:
   # bash waits for every member of a pipeline, so `sleep 6 | script` would time
   # the writer even after the script has already given up.
@@ -143,7 +140,7 @@ if it "yellow does not hang on an open stdin"; then
   ) &
   writer=$!
   start=$SECONDS
-  "$TAB_STATE" yellow <"$SANDBOX/stdin"
+  "$TAB_STATE" agent-start <"$SANDBOX/stdin"
   elapsed=$((SECONDS - start))
   kill "$writer" 2>/dev/null
   wait "$writer" 2>/dev/null
@@ -186,6 +183,93 @@ if it "a turn that never sends start self-heals"; then
   clear_out
   "$TAB_STATE" green
   check "$CURRENT" "$GREEN" "$(out)"
+fi
+
+# ------------------------------------------------------------- subagent colour
+
+agent() { # agent-start|agent-stop id
+  printf '{"agent_id":"%s","agent_type":"general-purpose"}' "$2" | "$TAB_STATE" "$1"
+}
+
+if it "agent-start paints the tab blue"; then
+  "$TAB_STATE" start
+  clear_out
+  agent agent-start ag_one
+  check "$CURRENT" "$BLUE" "$(out)"
+fi
+
+if it "green stays blue while a subagent is outstanding"; then
+  "$TAB_STATE" start
+  agent agent-start ag_one
+  clear_out
+  "$TAB_STATE" green
+  check "$CURRENT" "$BLUE" "$(out)"
+fi
+
+if it "blue holds when one of two subagents finishes"; then
+  "$TAB_STATE" start
+  agent agent-start ag_one
+  agent agent-start ag_two
+  clear_out
+  agent agent-stop ag_one
+  check "$CURRENT (still blue)" "$BLUE" "$(out)"
+  clear_out
+  agent agent-stop ag_two
+  check "$CURRENT (back to green)" "$GREEN" "$(out)"
+fi
+
+if it "a finished turn stays blue while subagents run"; then
+  # Subagents outlive the turn that dispatched them.
+  "$TAB_STATE" start
+  agent agent-start ag_one
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT" "$BLUE" "$(out)"
+fi
+
+if it "the last subagent of a closed turn restores the default"; then
+  "$TAB_STATE" start
+  agent agent-start ag_one
+  "$TAB_STATE" reset
+  clear_out
+  agent agent-stop ag_one
+  check "$CURRENT" "$DEFAULT" "$(out)"
+fi
+
+if it "session boundaries forget outstanding subagents"; then
+  "$TAB_STATE" start
+  agent agent-start ag_one
+  agent agent-start ag_two
+  clear_out
+  "$TAB_STATE" session
+  check "$CURRENT (default)" "$DEFAULT" "$(out)"
+  check "$CURRENT (drained)" "0" "$(find "$STATE_DIR" -name 'agent-*' | wc -l | tr -d ' ')"
+fi
+
+if it "agent events without an agent_id are ignored"; then
+  "$TAB_STATE" start
+  clear_out
+  echo '{"session_id":"abc"}' | "$TAB_STATE" agent-start
+  check "$CURRENT (no paint)" "" "$(out)"
+  check "$CURRENT (no token)" "0" "$(find "$STATE_DIR" -name 'agent-*' | wc -l | tr -d ' ')"
+fi
+
+if it "stale subagent tokens are swept"; then
+  "$TAB_STATE" start
+  agent agent-start ag_stuck
+  # A SubagentStop that never arrived must not strand the tab blue forever.
+  printf '%s\n' "$(($(date +%s) - 100000))" >"$STATE_DIR/agent-out-ag_stuck"
+  clear_out
+  agent agent-start ag_live
+  agent agent-stop ag_live
+  check "$CURRENT (swept)" "$GREEN" "$(out)"
+fi
+
+if it "an agent_id cannot escape the state directory"; then
+  "$TAB_STATE" start
+  agent agent-start '../../../../tmp/pwned'
+  check "$CURRENT" "absent" "$(exists /tmp/pwned)"
+  check "$CURRENT (contained)" "1" "$(find "$STATE_DIR" -name 'agent-*' | wc -l | tr -d ' ')"
 fi
 
 # --------------------------------------------------------------- disable flag
@@ -308,7 +392,30 @@ print(sum(1 for gs in d.get("hooks",{}).values() for g in gs
 if it "install wires every event"; then
   seed_settings
   "$INSTALL" >/dev/null 2>&1
-  check "$CURRENT" "7" "$(count_hooks tab-state.sh)"
+  check "$CURRENT" "10" "$(count_hooks tab-state.sh)"
+fi
+
+if it "install wires both Notification matchers"; then
+  seed_settings
+  "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT" "idle_prompt=reset permission_prompt=yellow" \
+    "$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+out=[]
+for g in d["hooks"]["Notification"]:
+    state=g["hooks"][0]["command"].rsplit(" ",1)[1]
+    out.append("%s=%s" % (g.get("matcher","-"), state))
+print(" ".join(sorted(out)))' "$SETTINGS")"
+fi
+
+if it "install wires the subagent events"; then
+  seed_settings
+  "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT" "agent-start agent-stop" \
+    "$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print(" ".join(d["hooks"][e][0]["hooks"][0]["command"].rsplit(" ",1)[1]
+                for e in ("SubagentStart","SubagentStop")))' "$SETTINGS")"
 fi
 
 if it "install preserves unrelated settings and hooks"; then
@@ -347,7 +454,7 @@ if it "install is idempotent"; then
   "$INSTALL" >/dev/null 2>&1
   "$INSTALL" >/dev/null 2>&1
   "$INSTALL" >/dev/null 2>&1
-  check "$CURRENT (ours)" "7" "$(count_hooks tab-state.sh)"
+  check "$CURRENT (ours)" "10" "$(count_hooks tab-state.sh)"
   check "$CURRENT (foreign)" "1" "$(count_hooks unrelated-tool)"
   check "$CURRENT (one backup)" "1" "$(find "$HOME/.claude" -name 'settings.json.bak*' | wc -l | tr -d ' ')"
 fi

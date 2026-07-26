@@ -86,22 +86,31 @@ import json, os, re, shutil, sys
 
 path, mode, dry = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
 
-# PreToolUse matters as much as PostToolUse: without it the tab stays yellow
-# for the whole duration of a long tool call you just approved.
+# (event, matcher, state). PreToolUse matters as much as PostToolUse: without
+# it the tab stays yellow for the whole duration of a long tool call you just
+# approved. The two Notification matchers split the real permission prompt from
+# the idle nudge, which the script would otherwise have to tell apart by
+# string-matching the payload.
 SPEC = [
-    ("UserPromptSubmit", "start"),
-    ("PreToolUse", "green"),
-    ("PostToolUse", "green"),
-    ("Notification", "yellow"),
-    ("Stop", "reset"),
-    ("SessionEnd", "reset"),
-    ("SessionStart", "reset"),
+    ("UserPromptSubmit", None, "start"),
+    ("PreToolUse", None, "green"),
+    ("PostToolUse", None, "green"),
+    ("Notification", "permission_prompt", "yellow"),
+    ("Notification", "idle_prompt", "reset"),
+    ("Stop", None, "reset"),
+    ("SessionEnd", None, "session"),
+    ("SessionStart", None, "session"),
+    ("SubagentStart", None, "agent-start"),
+    ("SubagentStop", None, "agent-stop"),
 ]
 
 # Match only the exact commands this script generates (any state, so older
 # wirings are recognised too). A substring test would also claim a wrapper
 # that merely mentions the path, and delete it on uninstall.
-OWNED = re.compile(r"^bash ~/\.claude/tab-state\.sh (?:start|green|yellow|reset)$")
+OWNED = re.compile(
+    r"^bash ~/\.claude/tab-state\.sh "
+    r"(?:start|green|yellow|reset|session|agent-start|agent-stop)$"
+)
 
 def note(msg):
     print(("  would: " if dry else "  ") + msg)
@@ -121,7 +130,7 @@ hooks = data.get("hooks") or {}
 # Strip our previous entries so re-running never stacks duplicates. On install
 # only touch events we are about to rewire: an event we do not ship (someone's
 # hand-wired PreCompact, say) is theirs to keep. Uninstall clears all of them.
-scope = [e for e, _ in SPEC] if mode == "install" else list(hooks)
+scope = [e for e, _, _ in SPEC] if mode == "install" else list(hooks)
 for event in scope:
     groups = []
     for group in hooks.get(event, []):
@@ -137,10 +146,13 @@ for event in scope:
         del hooks[event]
 
 if mode == "install":
-    for event, state in SPEC:
+    for event, matcher, state in SPEC:
         entry = {"type": "command", "command": "bash ~/.claude/tab-state.sh %s" % state}
-        hooks.setdefault(event, []).append({"hooks": [entry]})
-        note("wired %s -> %s" % (event, state))
+        group = {"hooks": [entry]}
+        if matcher:
+            group = {"matcher": matcher, "hooks": [entry]}
+        hooks.setdefault(event, []).append(group)
+        note("wired %s%s -> %s" % (event, "/" + matcher if matcher else "", state))
 
 if hooks:
     data["hooks"] = hooks

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- **Blue tab while subagents are running.** `SubagentStart` and `SubagentStop`
+  both carry an `agent_id`, so each outstanding subagent gets a token file and
+  "any running?" is a glob — no shared counter to race on. Blue outranks green,
+  and survives `Stop`, because subagents outlive the turn that dispatched them.
+  Needs Claude Code 2.0.43+.
+
 ### Fixed
 
 - The tab no longer sticks green when a session is interrupted, quit, or
@@ -11,9 +19,11 @@
 - A late `PostToolUse` green from a parallel tool call can no longer land after
   `Stop` and strand the tab green. `reset` closes the turn and `start` reopens
   it.
-- The idle-nudge filter reads the payload's `message` field instead of grepping
-  the whole JSON, so a path containing "waiting for your input" no longer hides
-  a real permission prompt.
+- The idle nudge and a real permission prompt are now told apart by Claude
+  Code's `idle_prompt` / `permission_prompt` matchers rather than by string
+  matching the payload. The old filter grepped the whole JSON, so a path
+  containing "waiting for your input" hid a real prompt, and any rewording of
+  the nudge would have broken it.
 - An unclosed stdin can no longer hang the hook until Claude Code's timeout.
 - Unknown or missing arguments now exit 1 instead of succeeding silently, so a
   typo in `settings.json` is visible. Exit 1 and not 2: Claude Code reads hook
@@ -28,7 +38,7 @@
   if it doesn't already parse, and only claims entries it generated, so
   re-running is safe and unrelated hooks survive. `--dry-run`, `--no-hooks`,
   `--uninstall`.
-- `tests/run.sh` — 57 assertions driven through env seams rather than a real
+- `tests/run.sh` — 69 assertions driven through env seams rather than a real
   terminal.
 - CI (shellcheck, plus the suite on macOS and Ubuntu), `LICENSE`, `.gitignore`.
 
@@ -47,7 +57,12 @@
 
 ### Migration
 
-Run `./install.sh` and then `/hooks`. `UserPromptSubmit` moves from `green` to
-`start`, and `PreToolUse` / `SessionEnd` / `SessionStart` are new. Old wiring
-keeps working — `green` still paints green — but a turn is only reopened by
-`start`, so without it the tab relies on the 60s staleness backstop.
+Run `./install.sh` and then `/hooks` — the wiring changed enough that old
+`settings.json` entries no longer cover it:
+
+- `UserPromptSubmit` moves from `green` to `start`
+- `Notification` splits into `permission_prompt` → `yellow` and `idle_prompt` →
+  `reset`. **Without this split an unmatched `Notification` hook turns the tab
+  yellow on the idle nudge**, since the script no longer inspects the payload.
+- `SessionEnd` / `SessionStart` use `session` (drains subagent tokens)
+- `PreToolUse`, `SubagentStart`, `SubagentStop` are new

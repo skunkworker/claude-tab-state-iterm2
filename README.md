@@ -7,8 +7,14 @@ or idle.
 | Tab color | Meaning | Hook event |
 |-----------|---------|------------|
 | 🟢 green  | Claude is running | `UserPromptSubmit`, `PreToolUse`, `PostToolUse` |
-| 🟡 yellow | Claude needs you (permission / question) | `Notification` |
+| 🔵 blue   | waiting for subagents | `SubagentStart` / `SubagentStop` |
+| 🟡 yellow | Claude needs you (permission / question) | `Notification` (`permission_prompt`) |
 | default   | done / idle / session over | `Stop`, `SessionEnd`, `SessionStart` |
+
+Blue outranks green: while any subagent is outstanding the tab stays blue even
+as the parent keeps calling tools, and it stays blue after `Stop` — subagents
+outlive the turn that dispatched them, so a finished turn with work still
+running does not go dark.
 
 ## Install
 
@@ -21,9 +27,13 @@ cd claude-tab-state-iterm2
 Then run `/hooks` in Claude Code (or restart it) to load the wiring.
 
 `install.sh` symlinks `tab-state.sh` to `~/.claude/tab-state.sh` and merges the
-hook block into `~/.claude/settings.json`. It backs the file up first, only
-touches entries that mention `tab-state.sh`, and leaves every other hook alone —
-so re-running it is safe and never stacks duplicates.
+hook block into `~/.claude/settings.json`. It backs the file up first, claims
+only the exact commands it generates, and leaves every other hook alone — so
+re-running it is safe and never stacks duplicates.
+
+Needs Claude Code **2.0.43 or newer** for the `SubagentStart` event and the
+`agent_id` hook field. On older versions everything except the blue subagent
+state still works.
 
 ```sh
 ./install.sh --dry-run     # show what would change, touch nothing
@@ -38,10 +48,15 @@ If you would rather wire it by hand, add this to `~/.claude/settings.json`:
   "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh start" }] }],
   "PreToolUse":       [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh green" }] }],
   "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh green" }] }],
-  "Notification":     [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh yellow" }] }],
+  "Notification": [
+    { "matcher": "permission_prompt", "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh yellow" }] },
+    { "matcher": "idle_prompt",       "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh reset" }] }
+  ],
   "Stop":             [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh reset" }] }],
-  "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh reset" }] }],
-  "SessionStart":     [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh reset" }] }]
+  "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh session" }] }],
+  "SessionStart":     [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh session" }] }],
+  "SubagentStart":    [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh agent-start" }] }],
+  "SubagentStop":     [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh agent-stop" }] }]
 }
 ```
 
@@ -86,10 +101,19 @@ almost nothing per tool call.
 
 - **Idle vs. real prompts.** The `Notification` event fires both for genuine
   permission/question prompts **and** for the idle "Claude is waiting for your
-  input" nudge (~60s after a turn ends). The script reads the notification
-  payload's `message` field and only turns the tab yellow for the former; the
-  idle nudge resets instead. A payload it cannot parse is treated as a real
-  prompt — better a spurious yellow than a missed one.
+  input" nudge (~60s after a turn ends). Claude Code splits them with the
+  `permission_prompt` and `idle_prompt` matchers, so the two are wired to
+  different states and the script never has to look at the payload. An earlier
+  version string-matched the message text, which broke whenever a path happened
+  to contain the same wording and would have broken again on any rewording.
+
+- **Counting subagents.** `SubagentStart` and `SubagentStop` both carry an
+  `agent_id`, so each outstanding subagent gets its own token file and "any
+  running?" is a glob. A counter in a shared file would be a read-modify-write
+  race between the hooks of agents starting and finishing at the same moment.
+  Tokens are keyed by tty as well, so a second session in another tab cannot
+  color yours. If a `SubagentStop` never arrives, session boundaries drain the
+  set and a staleness sweep is the backstop.
 
 - **Not getting stuck.** `Stop` does not fire when you interrupt, quit, or
   crash, which used to leave the tab green with nothing behind it — hence
@@ -120,9 +144,9 @@ almost nothing per tool call.
 ## Customizing
 
 - **Colors:** edit the `set_color R G B` values in `tab-state.sh` (0–255).
-- **Yellow trigger:** the idle filter matches the string
-  `waiting for your input`; if a future Claude Code version rewords that nudge,
-  update the `grep` pattern.
+- **Subagent staleness:** `AGENT_STALE_AFTER` (default 2h) is how long a
+  subagent whose `SubagentStop` never arrived is believed. Raise it if you run
+  longer agents than that.
 
 ## Development
 
