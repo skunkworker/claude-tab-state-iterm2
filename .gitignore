@@ -1,0 +1,18 @@
+# Claude Code local state. Project-level .claude/settings.json and CLAUDE.md are
+# deliberately NOT ignored — those are meant to be shared. Only the per-machine
+# files are.
+.claude/settings.local.json
+.claude/*.local.json
+CLAUDE.local.md
+
+# Session-memory tooling. It ships its own nested .gitignore, but that file is
+# tool-generated and would stop protecting the repo the moment it goes missing.
+.remember/
+
+# Backups install.sh writes next to whatever it rewrites, in case anyone points
+# it at a checkout rather than ~/.claude.
+*.bak
+*.bak.[0-9]*
+settings.json.tmp
+
+.DS_Store

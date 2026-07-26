@@ -336,7 +336,7 @@ seed_settings() {
 {
   "model": "opus",
   "hooks": {
-    "PreToolUse": [{"matcher":"Bash","hooks":[{"type":"command","command":"rtk hook claude"}]}],
+    "PreToolUse": [{"matcher":"Bash","hooks":[{"type":"command","command":"unrelated-tool --hook"}]}],
     "UserPromptSubmit": [{"hooks":[{"type":"command","command":"bash ~/.claude/tab-state.sh green"}]}],
     "Stop": [{"hooks":[{"type":"command","command":"bash ~/.claude/tab-state.sh reset"}]}]
   }
@@ -351,7 +351,7 @@ d=json.load(open(sys.argv[1]))
 print(sum(1 for gs in d.get("hooks",{}).values() for g in gs for h in g["hooks"] if "tab-state.sh" in h["command"]))'
 COUNT_FOREIGN='import json,sys
 d=json.load(open(sys.argv[1]))
-print(sum(1 for gs in d.get("hooks",{}).values() for g in gs for h in g["hooks"] if "rtk" in h["command"]))'
+print(sum(1 for gs in d.get("hooks",{}).values() for g in gs for h in g["hooks"] if "unrelated-tool" in h["command"]))'
 
 if it "install wires every event"; then
   setup
