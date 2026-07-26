@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+Dated entries, newest first. This is a personal tool with no releases to
+version, so the date something landed is the useful thing to know.
+
+## 2026-07-26
 
 ### Added
 
