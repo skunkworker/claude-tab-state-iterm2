@@ -1,0 +1,22 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# shfmt reads these directly (indent_style/indent_size/switch_case_indent), so
+# `shfmt -d .` needs no flags and CI cannot drift from your editor.
+[*.sh]
+indent_style = space
+indent_size = 2
+switch_case_indent = true
+
+[*.{yml,yaml,json}]
+indent_style = space
+indent_size = 2
+
+# Trailing double-space is a hard line break in Markdown.
+[*.md]
+trim_trailing_whitespace = false

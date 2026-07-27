@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: shellcheck --severity=style ./*.sh tests/*.sh
+      # No flags: shfmt takes indent_style/indent_size/switch_case_indent from
+      # .editorconfig, so CI and your editor cannot disagree.
+      - uses: mfinelli/setup-shfmt@v3
+      - run: shfmt -d .
+
+  test:
+    # macOS is the real target; ubuntu catches accidental BSD-only assumptions.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash tests/run.sh
