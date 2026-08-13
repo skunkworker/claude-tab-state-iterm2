@@ -54,6 +54,26 @@ out() { cat "$TAB_STATE_DEV"; }
 clear_out() { : >"$TAB_STATE_DEV"; }
 exists() { if [ -e "$1" ]; then echo present; else echo absent; fi; }
 
+# Portable mtime surgery: BSD touch -v and GNU touch -d disagree, python3 does
+# not, and the install tests already require it.
+age() { # file seconds
+  python3 -c 'import os,sys,time
+t = time.time() - int(sys.argv[2])
+os.utime(sys.argv[1], (t, t))' "$1" "$2"
+}
+
+agent() { # agent-start|agent-stop id
+  printf '{"agent_id":"%s","agent_type":"general-purpose"}' "$2" | "$TAB_STATE" "$1"
+}
+agent_count() { find "$STATE_DIR" -name 'agent-*' | wc -l | tr -d ' '; }
+
+# The one writer of the registry record format, so a change to it lands once.
+record() {              # tty owner state
+  mkdir -p "$STATE_DIR" # the script creates it lazily; we may be first
+  printf '%s %s %s\n' "$1" "$2" "$3" >"$STATE_DIR/tty-${1##*/}"
+}
+shown() { cut -d' ' -f3 <"$REGISTRY"; } # what our own tab is registered as
+
 # Render escapes readable so a mismatch is diagnosable.
 show() { printf '%s' "$1" | sed -e "s/$ESC/<ESC>/g" -e "s/$BEL/<BEL>/g"; }
 
@@ -160,11 +180,14 @@ if it "green is suppressed while the turn is closed"; then
   check "$CURRENT" "" "$(out)"
 fi
 
-if it "the latch holds well past a couple of seconds"; then
-  # The old implementation used a 2s window; a late green must still lose.
+if it "the latch never expires"; then
+  # Claude Code does model work of its own after a turn ends — the away summary,
+  # the session title — and its tool hooks arrive minutes later with no `start`
+  # before them and no `Stop` behind them. Any expiry lets one of those repaint
+  # a finished tab green for good, which is exactly what was seen in the wild.
   "$TAB_STATE" reset
   clear_out
-  printf '%s\n' "$(($(date +%s) - 30))" >"$MARKER"
+  age "$MARKER" 3600
   "$TAB_STATE" green
   check "$CURRENT" "" "$(out)"
 fi
@@ -177,19 +200,109 @@ if it "start reopens the turn so the next green paints"; then
   check "$CURRENT" "$GREEN" "$(out)"
 fi
 
-if it "a turn that never sends start self-heals"; then
-  "$TAB_STATE" reset
-  printf '%s\n' "$(($(date +%s) - 3600))" >"$MARKER"
+if it "a Stop landing mid-paint does not strand the tab green"; then
+  # The latch is a test followed by a paint, so only a real interleaving
+  # exercises the re-check that follows it. A fifo gives us one: the paint
+  # blocks on open until something reads, so the Stop can land mid-brushstroke.
+  mkfifo "$SANDBOX/fifo"
+  mkdir -p "$STATE_DIR"
+  TAB_STATE_DEV="$SANDBOX/fifo" "$TAB_STATE" green &
+  painter=$!
+  # The record is written immediately before the paint blocks opening the fifo,
+  # so it is a precise "past the latch test" signal — better than a fixed sleep.
+  while [ ! -e "$STATE_DIR/tty-fifo" ]; do sleep 0.05; done
+  : >"$STATE_DIR/stopped-fifo"
+  # One reader per emit: each opens and closes the fifo, so a single cat would
+  # take the first EOF and leave the second write with nowhere to go.
+  (
+    cat "$SANDBOX/fifo"
+    cat "$SANDBOX/fifo"
+  ) >"$SANDBOX/drain" &
+  reader=$!
+  wait "$painter"
+  # Regression case: only green was written, so the second reader is still
+  # blocked on its open. Pair with it, so a failure fails instead of hanging.
+  kill -0 "$reader" 2>/dev/null && : >"$SANDBOX/fifo"
+  wait "$reader" 2>/dev/null
+  check "$CURRENT" "$GREEN$DEFAULT" "$(cat "$SANDBOX/drain")"
+fi
+
+if it "a green after the turn closed clears a tab left painted"; then
+  # The same stray hook, arriving at a tab whose turn ended without clearing it.
+  # It is the last event that tab will ever see, so it heals instead of painting.
+  "$TAB_STATE" start
+  "$TAB_STATE" green
+  : >"$MARKER" # a Stop whose reset never reached the tab
   clear_out
   "$TAB_STATE" green
-  check "$CURRENT" "$GREEN" "$(out)"
+  check "$CURRENT (cleared)" "$DEFAULT" "$(out)"
+  check "$CURRENT (deregistered)" "absent" "$(exists "$REGISTRY")"
+fi
+
+if it "a green after the turn closed heals a state it does not recognize"; then
+  # Our own tab and the foreign sweep share one predicate for what outlives a
+  # turn, so a state added later ages out here too rather than becoming
+  # un-healable on the one tab a single-tab user has.
+  "$TAB_STATE" start
+  "$TAB_STATE" green
+  record "$TAB_STATE_DEV" $$ future-state
+  : >"$MARKER"
+  clear_out
+  "$TAB_STATE" green
+  check "$CURRENT" "$DEFAULT" "$(out)"
+fi
+
+if it "a green after the turn closed spares a tab still waiting on you"; then
+  # `hold` outlives the turn: an unanswered permission prompt is still true.
+  "$TAB_STATE" start
+  "$TAB_STATE" yellow
+  : >"$MARKER"
+  clear_out
+  "$TAB_STATE" green
+  check "$CURRENT (untouched)" "" "$(out)"
+  check "$CURRENT (still registered)" "present" "$(exists "$REGISTRY")"
+fi
+
+# ------------------------------------------------------------------- compaction
+
+# `SessionStart` fires for a compact, but the turn that triggered it is still
+# running — so a compact must not touch the latch in either direction.
+compact() { echo '{"source":"compact","session_id":"abc"}' | "$TAB_STATE" session; }
+
+if it "a compact mid-turn leaves the turn open"; then
+  "$TAB_STATE" start
+  clear_out
+  compact
+  check "$CURRENT (tab untouched)" "" "$(out)"
+  "$TAB_STATE" green
+  check "$CURRENT (still paints)" "$GREEN" "$(out)"
+fi
+
+if it "a compact between turns leaves the turn closed"; then
+  "$TAB_STATE" reset
+  compact
+  clear_out
+  "$TAB_STATE" green
+  check "$CURRENT" "" "$(out)"
+fi
+
+if it "a compact keeps outstanding subagents"; then
+  "$TAB_STATE" start
+  agent agent-start ag_one
+  clear_out
+  compact
+  check "$CURRENT (kept)" "1" "$(agent_count)"
+  check "$CURRENT (still blue)" "" "$(out)"
+fi
+
+if it "a real session boundary still resets"; then
+  "$TAB_STATE" start
+  clear_out
+  echo '{"source":"startup","session_id":"abc"}' | "$TAB_STATE" session
+  check "$CURRENT" "$DEFAULT" "$(out)"
 fi
 
 # ------------------------------------------------------------- subagent colour
-
-agent() { # agent-start|agent-stop id
-  printf '{"agent_id":"%s","agent_type":"general-purpose"}' "$2" | "$TAB_STATE" "$1"
-}
 
 if it "agent-start paints the tab blue"; then
   "$TAB_STATE" start
@@ -241,9 +354,9 @@ if it "session boundaries forget outstanding subagents"; then
   agent agent-start ag_one
   agent agent-start ag_two
   clear_out
-  "$TAB_STATE" session
+  "$TAB_STATE" session </dev/null
   check "$CURRENT (default)" "$DEFAULT" "$(out)"
-  check "$CURRENT (drained)" "0" "$(find "$STATE_DIR" -name 'agent-*' | wc -l | tr -d ' ')"
+  check "$CURRENT (drained)" "0" "$(agent_count)"
 fi
 
 if it "agent events without an agent_id are ignored"; then
@@ -251,7 +364,7 @@ if it "agent events without an agent_id are ignored"; then
   clear_out
   echo '{"session_id":"abc"}' | "$TAB_STATE" agent-start
   check "$CURRENT (no paint)" "" "$(out)"
-  check "$CURRENT (no token)" "0" "$(find "$STATE_DIR" -name 'agent-*' | wc -l | tr -d ' ')"
+  check "$CURRENT (no token)" "0" "$(agent_count)"
 fi
 
 if it "stale subagent tokens are swept"; then
@@ -269,7 +382,7 @@ if it "an agent_id cannot escape the state directory"; then
   "$TAB_STATE" start
   agent agent-start '../../../../tmp/pwned'
   check "$CURRENT" "absent" "$(exists /tmp/pwned)"
-  check "$CURRENT (contained)" "1" "$(find "$STATE_DIR" -name 'agent-*' | wc -l | tr -d ' ')"
+  check "$CURRENT (contained)" "1" "$(agent_count)"
 fi
 
 # --------------------------------------------------------------- disable flag
@@ -290,7 +403,7 @@ if it "disabling forgets outstanding subagents"; then
   agent agent-start ag_one
   : >"$DISABLED"
   "$TAB_STATE" green
-  check "$CURRENT (drained)" "0" "$(find "$STATE_DIR" -name 'agent-*' | wc -l | tr -d ' ')"
+  check "$CURRENT (drained)" "0" "$(agent_count)"
   rm -f "$DISABLED"
   "$TAB_STATE" start
   clear_out
@@ -302,7 +415,7 @@ if it "toggle off forgets outstanding subagents"; then
   "$TAB_STATE" start
   agent agent-start ag_one
   "$TOGGLE" off >/dev/null 2>&1
-  check "$CURRENT (drained)" "0" "$(find "$STATE_DIR" -name 'agent-*' | wc -l | tr -d ' ')"
+  check "$CURRENT (drained)" "0" "$(agent_count)"
   "$TOGGLE" on >/dev/null 2>&1
   "$TAB_STATE" start
   clear_out
@@ -312,12 +425,12 @@ fi
 
 if it "session reaps records for ttys that are gone"; then
   "$TAB_STATE" green
-  echo "$SANDBOX/vanished" >"$STATE_DIR/tty-vanished"
+  # A live owner, but a tty that is gone — which outranks it.
+  record "$SANDBOX/vanished" $$ busy
   : >"$STATE_DIR/stopped-vanished"
-  "$TAB_STATE" session
+  "$TAB_STATE" session </dev/null
   check "$CURRENT (dead tty gone)" "absent" "$(exists "$STATE_DIR/tty-vanished")"
   check "$CURRENT (its marker gone)" "absent" "$(exists "$STATE_DIR/stopped-vanished")"
-  check "$CURRENT (live tty kept)" "present" "$(exists "$REGISTRY")"
 fi
 
 if it "the disable flag stays silent once nothing is painted"; then
@@ -354,7 +467,16 @@ fi
 
 if it "registers the tty it paints"; then
   "$TAB_STATE" green
-  check "$CURRENT" "$TAB_STATE_DEV" "$(cat "$REGISTRY")"
+  check "$CURRENT (dev)" "$TAB_STATE_DEV" "$(cut -d' ' -f1 <"$REGISTRY")"
+  check "$CURRENT (state)" "busy" "$(shown)"
+fi
+
+if it "records what the tab is showing"; then
+  "$TAB_STATE" yellow
+  check "$CURRENT (yellow)" "hold" "$(shown)"
+  "$TAB_STATE" start
+  agent agent-start ag_one
+  check "$CURRENT (blue)" "agents" "$(shown)"
 fi
 
 if it "registering is idempotent"; then
@@ -367,6 +489,133 @@ fi
 if it "does not register on reset"; then
   "$TAB_STATE" reset
   check "$CURRENT" "absent" "$(exists "$REGISTRY")"
+fi
+
+if it "deregisters the tab when it goes back to default"; then
+  # The registry is the set of painted tabs; an unpainted one has nothing for
+  # another tab's sweep — or toggle.sh — to clear.
+  "$TAB_STATE" green
+  check "$CURRENT (painted)" "present" "$(exists "$REGISTRY")"
+  "$TAB_STATE" reset
+  check "$CURRENT (cleared)" "absent" "$(exists "$REGISTRY")"
+fi
+
+# --------------------------------------------------------------- stranded tabs
+
+# A second terminal, registered as another session's painted tab. A plain file
+# stands in for its tty: the script only ever tests -w and writes to it.
+strand() { # owner-pid state -> path to the stand-in tty
+  local other="$SANDBOX/other"
+  : >"$other"
+  record "$other" "$1" "$2"
+  printf '%s' "$other"
+}
+
+dead_pid() {
+  (exit 0) &
+  local p=$!
+  wait "$p" 2>/dev/null
+  printf '%s' "$p"
+}
+
+if it "a turn end clears the tab of a session that died"; then
+  other=$(strand "$(dead_pid)" busy)
+  "$TAB_STATE" reset
+  check "$CURRENT (cleared)" "$DEFAULT" "$(cat "$other")"
+  check "$CURRENT (deregistered)" "absent" "$(exists "$STATE_DIR/tty-other")"
+fi
+
+if it "a turn end leaves a live session's tab alone"; then
+  other=$(strand $$ busy)
+  "$TAB_STATE" reset
+  check "$CURRENT (untouched)" "" "$(cat "$other")"
+  check "$CURRENT (still registered)" "present" "$(exists "$STATE_DIR/tty-other")"
+fi
+
+if it "a busy tab whose hooks went quiet is cleared"; then
+  # The failure this whole sweep exists for: the session is alive but no longer
+  # delivering hook events, so nothing in its own tab will ever clear it.
+  other=$(strand $$ busy)
+  age "$STATE_DIR/tty-other" 3600
+  "$TAB_STATE" reset
+  check "$CURRENT" "$DEFAULT" "$(cat "$other")"
+fi
+
+if it "the quiet-tab timeout is configurable"; then
+  other=$(strand $$ busy)
+  age "$STATE_DIR/tty-other" 3600
+  TAB_STATE_BUSY_TTL_MIN=120 "$TAB_STATE" reset
+  check "$CURRENT (within ttl)" "" "$(cat "$other")"
+fi
+
+if it "a quiet tab is spared while it waits on the user or a subagent"; then
+  # Both are legitimately long-lived: an unanswered permission prompt and a
+  # subagent that reports nothing for an hour. Only `busy` ages out.
+  for held in hold agents; do
+    other=$(strand $$ "$held")
+    age "$STATE_DIR/tty-other" 3600
+    "$TAB_STATE" reset
+    check "$CURRENT ($held)" "" "$(cat "$other")"
+  done
+fi
+
+if it "an unrecognized state ages out instead of being spared forever"; then
+  # Exemption is by name, so a state added later inherits the busy timeout
+  # rather than silently becoming un-healable.
+  other=$(strand $$ future-state)
+  age "$STATE_DIR/tty-other" 3600
+  "$TAB_STATE" reset
+  check "$CURRENT" "$DEFAULT" "$(cat "$other")"
+fi
+
+if it "a record from before the owner was tracked is healed"; then
+  # Written by an older tab-state.sh: no owner to check, and the session that
+  # wrote it is the reason the tab is stuck.
+  other=$(strand $$ busy)
+  printf '%s\n' "$other" >"$STATE_DIR/tty-other" # back to the one-field format
+  "$TAB_STATE" reset
+  check "$CURRENT" "$DEFAULT" "$(cat "$other")"
+fi
+
+if it "clearing a stranded tab drops its leftover state"; then
+  other=$(strand "$(dead_pid)" busy)
+  : >"$STATE_DIR/stopped-other"
+  : >"$STATE_DIR/agent-other-ag_one"
+  "$TAB_STATE" reset
+  check "$CURRENT (marker)" "absent" "$(exists "$STATE_DIR/stopped-other")"
+  check "$CURRENT (agent token)" "absent" "$(exists "$STATE_DIR/agent-other-ag_one")"
+fi
+
+if it "a session boundary sweeps too"; then
+  other=$(strand "$(dead_pid)" busy)
+  "$TAB_STATE" session </dev/null
+  check "$CURRENT" "$DEFAULT" "$(cat "$other")"
+fi
+
+if it "a stranded yellow tab is cleared once its session is gone"; then
+  # `hold` is exempt from the quiet timeout, not from its owner dying.
+  other=$(strand "$(dead_pid)" hold)
+  "$TAB_STATE" reset
+  check "$CURRENT" "$DEFAULT" "$(cat "$other")"
+fi
+
+if it "the hot path leaves sweeping to the turn end"; then
+  # The sweep costs a fork; PreToolUse and PostToolUse run constantly.
+  other=$(strand "$(dead_pid)" busy)
+  "$TAB_STATE" start
+  "$TAB_STATE" green
+  check "$CURRENT (untouched)" "" "$(cat "$other")"
+  check "$CURRENT (still registered)" "present" "$(exists "$STATE_DIR/tty-other")"
+fi
+
+if it "the sweep never touches the tab of the session running it"; then
+  other=$(strand "$(dead_pid)" busy)
+  "$TAB_STATE" start
+  agent agent-start ag_one
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (ours stays blue)" "$BLUE" "$(out)"
+  check "$CURRENT (theirs cleared)" "$DEFAULT" "$(cat "$other")"
 fi
 
 # -------------------------------------------------------------------- toggle.sh
@@ -389,9 +638,17 @@ if it "toggle off clears registered tabs"; then
   check "$CURRENT" "$DEFAULT" "$(out)"
 fi
 
+if it "toggle off clears a tab another session registered"; then
+  # Also pins the record format: read the whole line as the tty and the -w test
+  # fails, so the tab silently keeps its color.
+  other=$(strand $$ busy)
+  "$TOGGLE" off >/dev/null 2>&1
+  check "$CURRENT" "$DEFAULT" "$(cat "$other")"
+fi
+
 if it "toggle off prunes dead ttys from the registry"; then
   "$TAB_STATE" green
-  echo "$SANDBOX/gone" >"$STATE_DIR/tty-gone"
+  record "$SANDBOX/gone" $$ busy
   "$TOGGLE" off >/dev/null 2>&1
   check "$CURRENT (dead dropped)" "absent" "$(exists "$STATE_DIR/tty-gone")"
   check "$CURRENT (live kept)" "present" "$(exists "$REGISTRY")"

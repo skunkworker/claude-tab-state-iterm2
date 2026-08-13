@@ -25,8 +25,10 @@
 # everything below them avoids forking where bash can do the job.
 #
 # Env overrides (mainly for tests and unusual setups):
-#   TAB_STATE_DEV    write escapes here instead of resolving a tty
-#   TAB_STATE_FORCE  =1 skips the iTerm2 detection guard
+#   TAB_STATE_DEV            write escapes here instead of resolving a tty
+#   TAB_STATE_FORCE          =1 skips the iTerm2 detection guard
+#   TAB_STATE_BUSY_TTL_MIN   minutes before a quiet busy tab is cleared (30)
+#   TAB_STATE_AGENT_TTL_SEC  seconds before a subagent token is disbelieved (7200)
 
 set -u
 
@@ -34,19 +36,23 @@ RESET_SEQ='\033]6;1;bg;*;default\007'
 DISABLE_FLAG="${HOME:-}/.claude/tab-state.disabled"
 STATE_DIR="${HOME:-}/.claude/.tab-state"
 
-# A turn with no `start` (a resumed or compacted session) would otherwise keep
-# the tab dark for its whole duration, so the closed turn self-heals after this
-# many seconds. It only has to outlast scheduling skew between two hook
-# subprocesses, so it is deliberately far larger than that rather than tuned.
-STALE_AFTER=60
-
 # Backstop for a subagent whose SubagentStop never arrives (it errored, or the
 # session died). Generous: a long research subagent must not be swept while it
 # is still working. Session boundaries drain the whole set anyway.
-AGENT_STALE_AFTER=7200
+AGENT_STALE_AFTER="${TAB_STATE_AGENT_TTL_SEC:-7200}"
+
+# How long a tab may stay painted busy with nothing refreshing its registry
+# record before another tab's turn end clears it. Every tool call rewrites the
+# record, so only one very slow tool call goes this quiet mid-turn. Minutes,
+# because `find -mmin` is what ages the registry.
+BUSY_TTL_MIN="${TAB_STATE_BUSY_TTL_MIN:-30}"
 
 # ------------------------------------------------------------------ functions
 
+# Sets `dev` (the tty to paint) and `owner` (the first ancestor holding it —
+# the `claude` process itself, since hook subprocesses have no controlling
+# terminal). Globals rather than stdout: two values, and no subshell fork.
+#
 # One `ps` per level, asking for both fields at once. A single full-table
 # `ps -ax` snapshot needs fewer forks but measures ~2x slower: it resolves the
 # tty name of every process on the machine. Depth to `claude` is ~3.
@@ -58,7 +64,8 @@ resolve_dev() {
     read -r ppid tty <<<"$line"
     case "$tty" in
       ttys*)
-        printf '/dev/%s' "$tty"
+        dev="/dev/$tty"
+        owner=$pid
         return 0
         ;;
     esac
@@ -73,26 +80,46 @@ emit() { printf '%b' "$1" >"$dev" 2>/dev/null; }
 set_color() { # r g b
   emit "\033]6;1;bg;red;brightness;$1\007\033]6;1;bg;green;brightness;$2\007\033]6;1;bg;blue;brightness;$3\007"
 }
-reset_color() { emit "$RESET_SEQ"; }
+reset_color() {
+  emit "$RESET_SEQ"
+  unregister_tty
+}
 
-# One file per tty rather than one shared list: registration is an idempotent
-# write with no read, no dedupe, and no interleaving between the parallel hook
-# processes that can run at once. Matches how the other records are keyed.
-register_tty() { printf '%s\n' "$dev" >"${STATE_DIR}/tty-${dev##*/}" 2>/dev/null; }
+# The registry is the set of tabs currently painted: one file per tty, added on
+# paint and removed the moment the tab goes back to default. One file rather
+# than a shared list because registration is then an idempotent write with no
+# read, no dedupe, and no interleaving between the parallel hook processes that
+# can run at once. Matches how the other records are keyed.
+#
+# A foreign sweep judges the record (see heal_registry); its mtime is the "last
+# seen busy" clock — free, versus a `date` fork on the hot path.
+register_tty() { # busy|agents|hold
+  printf '%s %s %s\n' "$dev" "$owner" "$1" >"$TTY_RECORD" 2>/dev/null
+}
+unregister_tty() { rm -f "$TTY_RECORD" 2>/dev/null; }
+
+# Clear a tab we are giving up on and drop every record keyed to it. Takes only
+# the tty: every record this drops is keyed by that name, the registry entry
+# naming it included.
+forget_tty() { # tty
+  [ -w "$1" ] && printf '%b' "$RESET_SEQ" >"$1" 2>/dev/null
+  local key=${1##*/}
+  rm -f "${STATE_DIR}/tty-$key" "${STATE_DIR}/stopped-$key" "${STATE_DIR}/agent-$key-"* 2>/dev/null
+}
 
 # True while the turn is closed. `reset` closes it, `start` reopens it — a
-# latch rather than a timeout, because nothing in the payload can order a
-# PostToolUse green against the Stop that races it. The timestamp is only the
-# staleness backstop above. Costs zero forks when the marker is absent, which
-# is the whole of a normal turn.
-turn_is_closed() {
-  local stamped now
-  # stderr is silenced before the input redirect, not after: redirections are
-  # applied left to right, and a missing marker is the normal case.
-  read -r stamped 2>/dev/null <"$STOP_MARKER" || return 1
-  now=$(date +%s) || return 1
-  [ $((now - stamped)) -lt "$STALE_AFTER" ]
-}
+# latch, because nothing in the payload can order a PostToolUse green against
+# the Stop that races it. No expiry: Claude Code's own post-turn model work
+# (away summaries, titling) fires tool hooks minutes later with no `Stop`
+# behind them, so any window lets one repaint a finished tab green for good.
+turn_is_closed() { [ -e "$STOP_MARKER" ]; }
+
+# States that legitimately outlive the turn that painted them: a subagent and an
+# unanswered permission prompt are both long-lived. One predicate for both the
+# foreign sweep and our own tab, so the two cannot drift apart. Testing by name
+# rather than sweeping by name is deliberate — a state added later ages out like
+# `busy` instead of silently becoming un-healable.
+outlives_turn() { [ "$1" = agents ] || [ "$1" = hold ]; }
 
 # One token file per outstanding subagent, keyed by the agent_id that both
 # SubagentStart and SubagentStop carry. Counting in a shared file would be a
@@ -107,37 +134,70 @@ agents_running() { # fork-free: the hot path only asks "any?"
   return 1
 }
 
-# Swept only on the rare agent events, never on the hot path.
+# Swept only on the rare agent events, never on the hot path. The fork-free
+# "any?" first, so an empty set costs no `date`.
 sweep_agents() {
   local f stamped now
-  now=$(date +%s) || return 0
+  agents_running || return 0
+  now=$(date +%s 2>/dev/null) || return 0
   for f in "$AGENT_GLOB"*; do
     [ -e "$f" ] || continue
     read -r stamped 2>/dev/null <"$f" || stamped=0
     [ $((now - ${stamped:-0})) -ge "$AGENT_STALE_AFTER" ] && rm -f "$f" 2>/dev/null
   done
+  return 0
 }
 
-# The state dir gains one tty- and one stopped- file per terminal ever used and
-# never loses them on its own. Tiny, but unbounded; session boundaries are rare
-# enough to absorb the sweep. Only records for ttys that are gone are dropped —
-# another live session's tab must keep its own.
-reap_state() {
-  local f dev
+# Clear tabs no hook will ever come back for, and drop what they left behind.
+#
+# Every in-tab recovery path needs an event in that tab's own tty, so a session
+# that stops delivering them — killed, crashed, or its hook config rewritten
+# underneath it mid-session — stays painted forever, and other tabs are the only
+# ones left to notice. Clearing a tab that turns out to still be working costs
+# nothing: its next tool call repaints and re-registers it.
+heal_registry() {
+  local f d o s stale=""
   for f in "$STATE_DIR"/tty-*; do
     [ -e "$f" ] || continue
-    read -r dev 2>/dev/null <"$f" || continue
-    [ -w "$dev" ] || rm -f "$f" "${STATE_DIR}/stopped-${dev##*/}" 2>/dev/null
+    read -r d o s 2>/dev/null <"$f" || continue
+    [ "$d" = "$dev" ] && continue # our own tab: the dispatch below owns it
+    # A record with no owner predates this format; treat it as unowned. A tty
+    # that is gone skips the question entirely — forget_tty writes nothing.
+    if [ -w "$d" ] && [ -n "$o" ] && kill -0 "$o" 2>/dev/null; then
+      outlives_turn "$s" && continue
+      # One fork for the whole sweep, and only once a live-owner record has
+      # actually asked. `-mmin` lists the aged records, so the test itself stays
+      # fork-free; the newline sentinels make an empty result non-empty, which
+      # doubles as the "already ran" flag so this cannot fork twice.
+      [ -n "$stale" ] ||
+        stale=$'\n'$(find "$STATE_DIR" -maxdepth 1 -name 'tty-*' -mmin "+$BUSY_TTL_MIN" 2>/dev/null)$'\n'
+      [[ $stale == *$'\n'"$f"$'\n'* ]] || continue
+    fi
+    forget_tty "$d"
   done
 }
 
+# Every paint registers what it painted in the same breath, so the record a
+# foreign sweep reads cannot disagree with the color on the tab.
+paint() { # state r g b
+  register_tty "$1"
+  set_color "$2" "$3" "$4"
+}
+paint_agents() { paint agents 0 150 200; }
+
 # Busy means green normally, blue while subagents are outstanding.
+#
+# The green re-reads the latch after painting: every caller reaches here by
+# testing it first, and a Stop landing between that test and the brushstroke
+# leaves our color on top of its reset with no further hook coming to undo it.
+# It lives here rather than in one arm so no future paint site can forget it;
+# it costs one failed open, and blue is exempt because subagents outlive Stop.
 paint_busy() {
-  register_tty
   if agents_running; then
-    set_color 0 150 200
+    paint_agents
   else
-    set_color 0 170 0
+    paint busy 0 170 0
+    turn_is_closed && reset_color
   fi
 }
 
@@ -194,56 +254,86 @@ fi
 if [ -e "$DISABLE_FLAG" ]; then
   for f in "$STATE_DIR"/tty-*; do
     [ -e "$f" ] || continue
-    read -r d 2>/dev/null <"$f" || continue
-    [ -w "$d" ] && printf '%b' "$RESET_SEQ" >"$d" 2>/dev/null
-    rm -f "$f" 2>/dev/null
+    read -r d _ 2>/dev/null <"$f" || continue
+    forget_tty "$d"
   done
+  # The loop is a fork-free probe for leftovers no registry entry named; one
+  # `rm` then drains both classes, rather than one per file.
   for f in "$STATE_DIR"/agent-* "$STATE_DIR"/stopped-*; do
-    [ -e "$f" ] && rm -f "$f" 2>/dev/null
+    [ -e "$f" ] || continue
+    rm -f "$STATE_DIR"/agent-* "$STATE_DIR"/stopped-* 2>/dev/null
+    break
   done
   exit 0
 fi
 
-dev="${TAB_STATE_DEV:-$(resolve_dev)}"
+owner=$PPID              # stands in when TAB_STATE_DEV skips the walk
+dev="${TAB_STATE_DEV:-}" # doubles as the initializer resolve_dev may not set
+[ -n "$dev" ] || resolve_dev
 [ -n "$dev" ] && [ -w "$dev" ] || exit 0
 
-STOP_MARKER="${STATE_DIR}/stopped-${dev##*/}"
-AGENT_GLOB="${STATE_DIR}/agent-${dev##*/}-"
+# Every record this tab owns is keyed by its tty name, derived once here.
+key=${dev##*/}
+TTY_RECORD="${STATE_DIR}/tty-$key"
+STOP_MARKER="${STATE_DIR}/stopped-$key"
+AGENT_GLOB="${STATE_DIR}/agent-$key-"
 [ -d "$STATE_DIR" ] || mkdir -p "$STATE_DIR" 2>/dev/null
 
 # ------------------------------------------------------------------- dispatch
 
 case "$state" in
-  start | green)
-    # `start` reopens the turn; both then paint the same busy color.
-    [ "$state" = start ] && rm -f "$STOP_MARKER" 2>/dev/null
-    turn_is_closed && exit 0
+  start)
+    # UserPromptSubmit: the turn is open by definition, so reopen the latch.
+    rm -f "$STOP_MARKER" 2>/dev/null
+    paint_busy
+    ;;
+  green)
+    if turn_is_closed; then
+      # A tool hook after the turn ended — Claude Code's own post-turn work.
+      # Nothing follows it, so it does not paint; and if the tab is still
+      # registered in a state that should not have survived the turn, this is
+      # the last hook that will ever visit, so it clears it instead.
+      read -r _ _ shown 2>/dev/null <"$TTY_RECORD" &&
+        ! outlives_turn "$shown" && reset_color
+      exit 0
+    fi
     paint_busy
     ;;
   yellow)
     # Wired to Notification's `permission_prompt` matcher, so the idle nudge
     # never reaches this arm and no payload parsing is needed to tell them
     # apart. `idle_prompt` is wired to `reset` instead.
-    register_tty
-    set_color 235 190 0
+    paint hold 235 190 0
     ;;
   reset)
-    date +%s >"$STOP_MARKER" 2>/dev/null
+    # The marker is a flag, not a clock: nothing reads its contents, so it is
+    # written with a bare redirect rather than a `date` fork.
+    : >"$STOP_MARKER" 2>/dev/null
     # Subagents outlive the turn that dispatched them, so a finished turn with
     # work still outstanding stays blue rather than going dark.
     if agents_running; then
-      register_tty
-      set_color 0 150 200
+      paint_agents
     else
       reset_color
     fi
+    # Once a turn, off the hot path: the only chance a stranded tab in another
+    # terminal has of being cleaned up.
+    heal_registry
     ;;
   session)
-    # A session boundary is the one point where nothing can still be running.
-    rm -f "$AGENT_GLOB"* 2>/dev/null
-    reap_state
-    date +%s >"$STOP_MARKER" 2>/dev/null
-    reset_color
+    # A compact is not a boundary: `SessionStart` fires for it, but the turn
+    # that triggered it is still running. Touching the latch either way is
+    # wrong — closing it darkens the rest of that turn, opening it would unlatch
+    # a compact that happened between turns — so leave every record alone.
+    read_payload
+    json_field source
+    if [ "$FIELD" != compact ]; then
+      # Any other boundary is the one point where nothing can still be running.
+      rm -f "$AGENT_GLOB"* 2>/dev/null
+      : >"$STOP_MARKER" 2>/dev/null
+      reset_color
+    fi
+    heal_registry
     ;;
   agent-start)
     read_payload
@@ -251,8 +341,7 @@ case "$state" in
     [ -n "$FIELD" ] || exit 0
     sweep_agents
     date +%s >"${AGENT_GLOB}${FIELD//[^A-Za-z0-9_-]/_}" 2>/dev/null
-    register_tty
-    set_color 0 150 200
+    paint_agents
     ;;
   agent-stop)
     read_payload
@@ -262,8 +351,7 @@ case "$state" in
     sweep_agents
     # Hand the tab back to whatever the turn is actually doing.
     if agents_running; then
-      register_tty
-      set_color 0 150 200
+      paint_agents
     elif turn_is_closed; then
       reset_color
     else

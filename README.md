@@ -121,10 +121,46 @@ almost nothing per tool call.
   `SessionEnd`. And with parallel tool calls a slow `PostToolUse` green can
   land *after* `Stop`'s reset. Nothing in the payload can order those two, so
   `reset` closes the turn and `start` reopens it: green does not paint in
-  between. It is a latch rather than a timeout, because any timeout short
-  enough to be useful is also short enough to lose under load. A closed turn
-  does expire after 60s so that a session resumed without a `start` heals
-  itself rather than staying dark.
+  between. The latch is still a check followed by a paint, so `green` re-reads
+  it afterwards — a `Stop` that slips between the two would otherwise be
+  painted over by a green nobody is coming back to undo.
+
+- **Why the latch has no expiry.** It used to lapse after 60s, so that a
+  session resumed without a `start` healed rather than staying dark. That
+  window was the bug: a turn ended at 05:43:50 and three minutes later an
+  `away_summary` — Claude Code summarizing what happened while you were away —
+  fired a tool hook that found the latch stale and painted the tab green for
+  good. Claude Code does model work of its own after your turn ends, and those
+  hooks arrive with no `start` in front of them and, crucially, no `Stop`
+  behind them, so nothing is ever coming to undo the paint. The two mistakes
+  are not equally expensive: a falsely **dark** tab is the neutral default and
+  the next `Stop` corrects it, while a falsely **green** tab has you asking "is
+  it hung?" indefinitely. So the latch never lapses — only `start` reopens a
+  turn — and a `green` that finds the turn closed *and* its own tab still
+  registered busy clears it, since that stray hook is the last event that tab
+  will ever see.
+
+- **Compaction is not a session boundary.** `SessionStart` also fires when the
+  context is compacted, but the turn that triggered it is still running with
+  its subagents still outstanding. So a compact touches nothing: closing the
+  latch would darken the rest of that turn, and opening it would unlatch a turn
+  that had already ended — the same stuck-green bug by another route.
+
+- **Tabs other sessions abandoned.** Every one of those recovery paths needs a
+  hook event *in the tab's own terminal*. A session that stops delivering them
+  — `SIGKILL`, a crash, or its hook config rewritten mid-session, after which
+  Claude Code fires nothing there again — strands its tab colored, and only
+  another terminal can notice. So the registry of painted tabs records who owns
+  each one, and a sweep clears it: a tty that is gone, or an owner that no
+  longer exists, is cleared and forgotten. Every session boundary sweeps, and
+  that is the guarantee — the next `claude` you start in any tab heals the
+  others. Turn ends sweep as well, which only shortens the wait. An owner still
+  alive keeps its tab unless its record has been `busy` and untouched for 30
+  minutes, since every tool call rewrites it — waiting on you (yellow) or on a
+  subagent (blue) is exempt *by name*, both being legitimately long-lived, so a
+  state added later ages out rather than silently becoming un-healable.
+  Clearing a tab that turns out to still be working costs nothing: its next
+  tool call repaints it.
 
 - **Why `PreToolUse` too.** `PostToolUse` fires when a tool *finishes*. Without
   `PreToolUse`, approving a three-minute test run leaves the tab yellow for the
@@ -145,9 +181,13 @@ almost nothing per tool call.
 ## Customizing
 
 - **Colors:** edit the `set_color R G B` values in `tab-state.sh` (0–255).
-- **Subagent staleness:** `AGENT_STALE_AFTER` (default 2h) is how long a
-  subagent whose `SubagentStop` never arrived is believed. Raise it if you run
-  longer agents than that.
+- **Subagent staleness:** `TAB_STATE_AGENT_TTL_SEC` (default 7200, i.e. 2h) is
+  how long a subagent whose `SubagentStop` never arrived is believed. Raise it
+  if you run longer agents than that.
+- **Abandoned-tab timeout:** `TAB_STATE_BUSY_TTL_MIN` (default 30 minutes) is
+  how long a green tab may go without a hook event before another tab's turn
+  end clears it. Raise it if you routinely run single tool calls longer than
+  that and dislike the tab dropping to default until the call returns.
 
 ## Development
 
@@ -186,6 +226,8 @@ Claude Code.
 - `tests/run.sh` — the test suite.
 - `tests/probe-hooks.sh` — verifies the hook contract against installed Claude
   Code. Manual; needs the `claude` binary.
+- `docs/hardening.md` — the two stuck-tab incidents, what they cost, and the
+  gaps still open. Read before touching the turn latch or the sweep.
 
 ## License
 

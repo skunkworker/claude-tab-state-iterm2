@@ -21,7 +21,7 @@ reset_registered_ttys() {
   local f dev
   for f in "$STATE_DIR"/tty-*; do
     [ -e "$f" ] || continue
-    read -r dev 2>/dev/null <"$f" || continue
+    read -r dev _ 2>/dev/null <"$f" || continue # record is "dev owner state"
     if [ -w "$dev" ]; then
       printf '%b' "$RESET_SEQ" >"$dev" 2>/dev/null
     else
