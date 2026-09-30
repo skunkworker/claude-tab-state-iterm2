@@ -80,12 +80,11 @@ remove_link() {
 # Merge in place with python3 (present on any machine with the Xcode CLT).
 # The wiring spec lives here and nowhere else in this script; README.md
 # documents the same table for anyone wiring it by hand.
-merge_hooks() { # mode dry_run subagents_supported
+merge_hooks() { # mode dry_run claude_version
   python3 - "$SETTINGS" "$1" "$2" "$3" <<'PY'
 import json, os, re, shutil, sys
 
-path, mode, dry = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
-min_version_ok = sys.argv[4] == "1"
+path, mode, dry, version = sys.argv[1], sys.argv[2], sys.argv[3] == "1", sys.argv[4]
 
 # Follow a symlinked settings.json: os.replace below would otherwise swap the
 # link itself for a regular file and detach it from whatever it pointed at.
@@ -103,11 +102,27 @@ SPEC = [
     ("Notification", "permission_prompt", "yellow"),
     ("Notification", "idle_prompt", "reset"),
     ("Stop", None, "reset"),
+    ("StopFailure", None, "reset"),
     ("SessionEnd", None, "session"),
     ("SessionStart", None, "session"),
     ("SubagentStart", None, "agent-start"),
     ("SubagentStop", None, "agent-stop"),
 ]
+
+# Events newer than the oldest Claude Code this supports. What an older Claude
+# Code does with an unknown hook event is untested here, so do not hand it one.
+# StopFailure is what an API error sends instead of Stop; without it a rate
+# limit leaves the tab green.
+MIN_VERSION = {
+    "SubagentStart": (2, 0, 43),
+    "SubagentStop": (2, 0, 43),
+    "StopFailure": (2, 1, 78),
+}
+
+# An unknown version counts as new enough: someone installing this without
+# `claude` on PATH is wiring a machine they know better than we do.
+m = re.match(r"(\d+)\.(\d+)\.(\d+)", version)
+installed = tuple(int(g) for g in m.groups()) if m else None
 
 # Match only the exact commands this script generates (any state, so older
 # wirings are recognised too). A substring test would also claim a wrapper
@@ -151,13 +166,11 @@ for event in scope:
         del hooks[event]
 
 if mode == "install":
-    wiring = SPEC
-    if not min_version_ok:
-        # SubagentStart arrived in 2.0.43. What an older Claude Code does with
-        # an unknown hook event is untested here, so do not hand it one.
-        wiring = [s for s in SPEC if not s[0].startswith("Subagent")]
-        note("skipping SubagentStart/SubagentStop (needs Claude Code 2.0.43+)")
-    for event, matcher, state in wiring:
+    for event, matcher, state in SPEC:
+        need = MIN_VERSION.get(event)
+        if installed and need and installed < need:
+            note("skipping %s (needs Claude Code %s+)" % (event, ".".join(map(str, need))))
+            continue
         entry = {"type": "command", "command": "bash ~/.claude/tab-state.sh %s" % state}
         group = {"hooks": [entry]}
         if matcher:
@@ -187,35 +200,16 @@ os.replace(tmp, path)
 PY
 }
 
-# The blue subagent state needs SubagentStart (Claude Code 2.0.43). Assume a
-# new enough version when `claude` is absent — someone installing this without
-# the binary on PATH is wiring a machine they know better than we do.
-version_supports_subagents() {
-  local v major minor patch
-  command -v claude >/dev/null 2>&1 || return 0
-  v=$(claude --version 2>/dev/null) || return 0
-  v=${v%% *}
-  case "$v" in
-    [0-9]*.[0-9]*.[0-9]*) ;;
-    *) return 0 ;;
-  esac
-  IFS=. read -r major minor patch <<<"$v"
-  [ "$major" -gt 2 ] && return 0
-  [ "$major" -lt 2 ] && return 1
-  [ "$minor" -gt 0 ] && return 0
-  [ "$patch" -ge 43 ]
-}
-
 install_hooks() {
   if ! command -v python3 >/dev/null 2>&1; then
     say "hooks: python3 not found — add the wiring block from README.md to"
     say "       $SETTINGS by hand, then run /hooks."
     return 1
   fi
-  local subagents=0
-  version_supports_subagents && subagents=1
+  local version=""
+  command -v claude >/dev/null 2>&1 && version=$(claude --version 2>/dev/null)
   say "hooks:"
-  merge_hooks "$1" "$DRY_RUN" "$subagents"
+  merge_hooks "$1" "$DRY_RUN" "$version"
 }
 
 # ------------------------------------------------------------------- driver

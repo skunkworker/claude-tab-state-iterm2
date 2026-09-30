@@ -686,7 +686,7 @@ print(sum(1 for gs in d.get("hooks",{}).values() for g in gs
 if it "install wires every event"; then
   seed_settings
   "$INSTALL" >/dev/null 2>&1
-  check "$CURRENT" "10" "$(count_hooks tab-state.sh)"
+  check "$CURRENT" "11" "$(count_hooks tab-state.sh)"
 fi
 
 if it "install wires both Notification matchers"; then
@@ -748,7 +748,7 @@ if it "install is idempotent"; then
   "$INSTALL" >/dev/null 2>&1
   "$INSTALL" >/dev/null 2>&1
   "$INSTALL" >/dev/null 2>&1
-  check "$CURRENT (ours)" "10" "$(count_hooks tab-state.sh)"
+  check "$CURRENT (ours)" "11" "$(count_hooks tab-state.sh)"
   check "$CURRENT (foreign)" "1" "$(count_hooks unrelated-tool)"
   check "$CURRENT (one backup)" "1" "$(find "$HOME/.claude" -name 'settings.json.bak*' | wc -l | tr -d ' ')"
 fi
@@ -828,6 +828,26 @@ if it "install skips the subagent events on Claude Code older than 2.0.43"; then
   check "$CURRENT (rest wired)" "8" "$(count_hooks tab-state.sh)"
 fi
 
+# An API error ends the turn with StopFailure and no Stop, so without it a rate
+# limit leaves the tab green.
+has_event() { # event -> yes|no
+  python3 -c 'import json,sys
+print("yes" if sys.argv[2] in json.load(open(sys.argv[1])).get("hooks",{}) else "no")' "$SETTINGS" "$1"
+}
+
+if it "install wires StopFailure to reset from 2.1.78"; then
+  seed_settings
+  PATH="$(fake_claude 2.1.78)" "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT (2.1.78)" "reset" \
+    "$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print(d["hooks"]["StopFailure"][0]["hooks"][0]["command"].rsplit(" ",1)[1])' "$SETTINGS")"
+  seed_settings
+  PATH="$(fake_claude 2.1.77)" "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT (2.1.77 skipped)" "no" "$(has_event StopFailure)"
+  check "$CURRENT (2.1.77 subagents kept)" "yes" "$(has_event SubagentStart)"
+fi
+
 if it "install wires the subagent events on 2.0.43 and newer"; then
   seed_settings
   PATH="$(fake_claude 2.0.43)" "$INSTALL" >/dev/null 2>&1
@@ -844,7 +864,7 @@ if it "install follows a symlinked settings.json"; then
   ln -s "$real" "$SETTINGS"
   "$INSTALL" >/dev/null 2>&1
   check "$CURRENT (still a link)" "$real" "$(readlink "$SETTINGS")"
-  check "$CURRENT (target rewritten)" "10" \
+  check "$CURRENT (target rewritten)" "11" \
     "$(python3 -c 'import json,sys
 d=json.load(open(sys.argv[1]))
 print(sum(1 for gs in d.get("hooks",{}).values() for g in gs

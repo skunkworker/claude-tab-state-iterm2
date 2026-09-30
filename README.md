@@ -9,7 +9,7 @@ or idle.
 | 🟢 green  | Claude is running | `UserPromptSubmit`, `PreToolUse`, `PostToolUse` |
 | 🔵 blue   | waiting for subagents | `SubagentStart` / `SubagentStop` |
 | 🟡 yellow | Claude needs you (permission / question) | `Notification` (`permission_prompt`) |
-| default   | done / idle / session over | `Stop`, `SessionEnd`, `SessionStart` |
+| default   | done / idle / session over | `Stop`, `StopFailure`, `SessionEnd`, `SessionStart` |
 
 Blue outranks green: while any subagent is outstanding the tab stays blue even
 as the parent keeps calling tools, and it stays blue after `Stop` — subagents
@@ -32,9 +32,9 @@ only the exact commands it generates, and leaves every other hook alone — so
 re-running it is safe and never stacks duplicates.
 
 The blue subagent state needs Claude Code **2.0.43 or newer** (`SubagentStart`
-and the `agent_id` hook field). `install.sh` checks `claude --version` and
-simply leaves those two events unwired on anything older; every other color
-still works.
+and the `agent_id` hook field), and `StopFailure` needs **2.1.78**. `install.sh`
+checks `claude --version` and simply leaves an event unwired on anything older
+than it needs; every other color still works.
 
 ```sh
 ./install.sh --dry-run     # show what would change, touch nothing
@@ -54,6 +54,7 @@ If you would rather wire it by hand, add this to `~/.claude/settings.json`:
     { "matcher": "idle_prompt",       "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh reset" }] }
   ],
   "Stop":             [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh reset" }] }],
+  "StopFailure":      [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh reset" }] }],
   "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh session" }] }],
   "SessionStart":     [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh session" }] }],
   "SubagentStart":    [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh agent-start" }] }],
@@ -116,9 +117,12 @@ almost nothing per tool call.
   color yours. If a `SubagentStop` never arrives, session boundaries drain the
   set and a staleness sweep is the backstop.
 
-- **Not getting stuck.** `Stop` does not fire when you interrupt, quit, or
-  crash, which used to leave the tab green with nothing behind it — hence
-  `SessionEnd`. And with parallel tool calls a slow `PostToolUse` green can
+- **Not getting stuck.** `Stop` does not fire when the turn ends on an API
+  error — Claude Code sends `StopFailure` instead, so both reset. Nor does it
+  fire when you quit, which used to leave the tab green with nothing behind
+  it — hence `SessionEnd`; a crash sends nothing and is left to the sweep
+  below. An interrupt (Esc) sends neither `Stop` nor `SessionEnd`, so that tab
+  stays green until your next prompt, the idle nudge, or the sweep. And with parallel tool calls a slow `PostToolUse` green can
   land *after* `Stop`'s reset. Nothing in the payload can order those two, so
   `reset` closes the turn and `start` reopens it: green does not paint in
   between. The latch is still a check followed by a paint, so `green` re-reads
