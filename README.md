@@ -96,6 +96,8 @@ almost nothing per tool call.
   version "never changed colors"). The script walks up the process tree from
   `$PPID` to the parent `claude` process and writes to its real `/dev/ttysNNN`.
   Each session resolves its own tty, so multiple instances color the right tab.
+  The walk stops at a `claude` with no tty: that is a headless `claude -p` run
+  from inside another session, and the tab further up belongs to the parent.
   The walk asks each level for `ppid` and `tty` in one `ps`, which matters
   because it runs on every `PostToolUse`. A single full-table `ps -ax` snapshot
   needs fewer processes but measures about twice as slow — it resolves the tty

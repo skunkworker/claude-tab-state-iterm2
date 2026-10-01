@@ -54,15 +54,22 @@ BUSY_TTL_MIN="${TAB_STATE_BUSY_TTL_MIN:-30}"
 # the `claude` process itself, since hook subprocesses have no controlling
 # terminal). Globals rather than stdout: two values, and no subshell fork.
 #
-# One `ps` per level, asking for both fields at once. A single full-table
+# One `ps` per level, asking for every field at once. A single full-table
 # `ps -ax` snapshot needs fewer forks but measures ~2x slower: it resolves the
 # tty name of every process on the machine. Depth to `claude` is ~3.
+#
+# A `claude` with no tty is a headless session nested inside another one — a
+# `claude -p` run from the Bash tool, whose shell has no tty either. Walking
+# past it lands on the parent session's tab, and the nested SessionStart would
+# then reset that tab and drop its subagents mid-turn. It has no tab of its
+# own, so stop there. (An npm install runs as `node`, which this cannot tell
+# apart; that case walks on as before.)
 resolve_dev() {
-  local pid=$PPID line ppid tty
+  local pid=$PPID line ppid tty comm
   for _ in 1 2 3 4 5 6 7 8; do
-    line=$(ps -o ppid=,tty= -p "$pid" 2>/dev/null) || return 1
+    line=$(ps -o ppid=,tty=,comm= -p "$pid" 2>/dev/null) || return 1
     [ -n "$line" ] || return 1
-    read -r ppid tty <<<"$line"
+    read -r ppid tty comm <<<"$line"
     case "$tty" in
       ttys*)
         dev="/dev/$tty"
@@ -70,6 +77,7 @@ resolve_dev() {
         return 0
         ;;
     esac
+    [ "${comm##*/}" = claude ] && return 1
     [ -n "$ppid" ] && [ "$ppid" != 0 ] || return 1
     pid=$ppid
   done

@@ -507,6 +507,41 @@ if it "stays silent under screen"; then
   check "$CURRENT" "" "$(out)"
 fi
 
+# A fake process table for the tty walk, so it can be exercised without a real
+# terminal. Unknown pids (the hook's real parent) map to the first row.
+fake_ps() { # "pid ppid tty comm"... -> a PATH with that `ps` in front
+  local bin="$SANDBOX/psbin"
+  mkdir -p "$bin"
+  printf '%s\n' "$@" >"$SANDBOX/ps-table"
+  cat >"$bin/ps" <<EOF
+#!/bin/bash
+echo "\$*" >>"$SANDBOX/ps-calls"
+pid=\${!#}
+row=\$(awk -v p="\$pid" '\$1 == p' "$SANDBOX/ps-table")
+[ -n "\$row" ] || row=\$(head -1 "$SANDBOX/ps-table")
+echo "\$row" | cut -d' ' -f2-
+EOF
+  chmod +x "$bin/ps"
+  printf '%s:%s' "$bin" "$PATH"
+}
+
+if it "the tty walk stops at a nested headless claude"; then
+  # A `claude -p` run from the Bash tool: no tty on it or the shell under it,
+  # and the parent session's tab further up. Walking on would let the nested
+  # SessionStart reset that tab and drop its subagents mid-turn.
+  unset TAB_STATE_DEV
+  path=$(fake_ps "0 100 ?? sh" "100 200 ?? /opt/bin/claude" "200 1 ttys099 claude")
+  PATH="$path" "$TAB_STATE" start
+  check "$CURRENT" "2" "$(wc -l <"$SANDBOX/ps-calls" | tr -d ' ')"
+fi
+
+if it "the tty walk passes through processes that are not claude"; then
+  unset TAB_STATE_DEV
+  path=$(fake_ps "0 100 ?? sh" "100 200 ?? node" "200 1 ttys099 claude")
+  PATH="$path" "$TAB_STATE" start
+  check "$CURRENT" "3" "$(wc -l <"$SANDBOX/ps-calls" | tr -d ' ')"
+fi
+
 # ---------------------------------------------------------------- tty registry
 
 if it "registers the tty it paints"; then

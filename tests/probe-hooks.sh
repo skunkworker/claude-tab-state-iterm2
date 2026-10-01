@@ -9,8 +9,12 @@
 # session, so it needs the `claude` binary and spends API tokens. Run it by
 # hand when upgrading Claude Code.
 #
-# Everything happens in a temp dir with its own --settings file. Your real
-# ~/.claude is never read or written.
+# Everything happens in a temp dir with its own --settings file. That file is
+# loaded *on top of* your ~/.claude settings, not instead of them, so your own
+# hooks — tab-state.sh included — fire in the probe session too. Your user
+# settings stay loaded on purpose: their `env` may carry the API setup the
+# session needs. Run from a terminal, the probe may recolor that tab; run from
+# inside Claude Code, the nested session has no tty and tab-state.sh stays out.
 #
 # What it checks, in order of how quietly each would break us:
 #   1. SubagentStart / SubagentStop both fire.

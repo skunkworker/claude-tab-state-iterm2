@@ -24,6 +24,12 @@ version, so the date something landed is the useful thing to know.
   lost state reads as closed. It exists only during a turn, which also ends the
   `stopped-*` files that used to pile up forever — delete old ones with
   `rm ~/.claude/.tab-state/stopped-*`.
+- **A `claude -p` run inside a session reset its parent's tab.** The Bash tool's
+  shell has no tty, so the tty walk went straight past the nested `claude` to
+  the parent session's tab, and the nested `SessionStart` reset it and dropped
+  its subagents mid-turn. The walk now asks `ps` for `comm` in the same call
+  and stops at a `claude` with no tty. `tests/probe-hooks.sh` was one way to
+  hit it; its claim never to read `~/.claude` was also wrong and is corrected.
 
 ### Changed
 
