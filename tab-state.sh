@@ -20,9 +20,9 @@
 # Hooks run in a subprocess with NO controlling terminal, so /dev/tty fails.
 # We walk up the process tree to the parent `claude` process's real tty.
 #
-# This runs on every PostToolUse, so the cost of a single call
-# is the design constraint throughout: guards are ordered cheapest-first and
-# everything below them avoids forking where bash can do the job.
+# This runs on every PostToolUse, so the cost of a single call is the design
+# constraint throughout: guards are ordered cheapest-first and everything below
+# them avoids forking where bash can do the job.
 #
 # Env overrides (mainly for tests and unusual setups):
 #   TAB_STATE_DEV            write escapes here instead of resolving a tty
@@ -133,9 +133,9 @@ turn_is_closed() { [ ! -e "$OPEN_MARKER" ]; }
 # read-modify-write race between the hook processes of agents that start and
 # finish concurrently; a glob has no such problem and needs no locking. The
 # file is empty: its mtime is the start time, which is all the sweep reads.
-agents_running() { # [tty-key] — fork-free: the hot path only asks "any?"
+agents_running() { # [glob-prefix] — fork-free: the hot path only asks "any?"
   local f
-  for f in "${STATE_DIR}/agent-${1:-$key}-"*; do
+  for f in "${1:-$AGENT_GLOB}"*; do
     [ -e "$f" ] && return 0
     break
   done
@@ -152,7 +152,7 @@ agents_running() { # [tty-key] — fork-free: the hot path only asks "any?"
 outlives_turn() { # state tty-key
   case "$1" in
     hold) return 0 ;;
-    agents) agents_running "$2" ;;
+    agents) agents_running "${STATE_DIR}/agent-$2-" ;;
     *) return 1 ;;
   esac
 }
@@ -162,13 +162,8 @@ outlives_turn() { # state tty-key
 # agent event. The fork-free probe first, so a turn with no agents anywhere
 # costs no `find`.
 sweep_agents() {
-  local f
-  for f in "$STATE_DIR"/agent-*; do
-    [ -e "$f" ] || return 0
-    break
-  done
-  find "$STATE_DIR" -maxdepth 1 -name 'agent-*' -mmin "+$AGENT_TTL_MIN" \
-    -exec rm -f {} + 2>/dev/null
+  agents_running "$STATE_DIR/agent-" || return 0
+  find "$STATE_DIR" -maxdepth 1 -name 'agent-*' -mmin "+$AGENT_TTL_MIN" -delete 2>/dev/null
 }
 
 # Clear tabs no hook will ever come back for, and drop what they left behind.
