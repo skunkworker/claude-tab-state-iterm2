@@ -20,7 +20,7 @@
 # Hooks run in a subprocess with NO controlling terminal, so /dev/tty fails.
 # We walk up the process tree to the parent `claude` process's real tty.
 #
-# This runs on every PreToolUse and PostToolUse, so the cost of a single call
+# This runs on every PostToolUse, so the cost of a single call
 # is the design constraint throughout: guards are ordered cheapest-first and
 # everything below them avoids forking where bash can do the job.
 #

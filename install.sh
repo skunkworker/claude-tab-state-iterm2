@@ -90,14 +90,11 @@ path, mode, dry, version = sys.argv[1], sys.argv[2], sys.argv[3] == "1", sys.arg
 # link itself for a regular file and detach it from whatever it pointed at.
 path = os.path.realpath(path)
 
-# (event, matcher, state). PreToolUse matters as much as PostToolUse: without
-# it the tab stays yellow for the whole duration of a long tool call you just
-# approved. The two Notification matchers split the real permission prompt from
-# the idle nudge, which the script would otherwise have to tell apart by
-# string-matching the payload.
+# (event, matcher, state). The two Notification matchers split the real
+# permission prompt from the idle nudge, which the script would otherwise have
+# to tell apart by string-matching the payload.
 SPEC = [
     ("UserPromptSubmit", None, "start"),
-    ("PreToolUse", None, "green"),
     ("PostToolUse", None, "green"),
     ("Notification", "permission_prompt", "yellow"),
     ("Notification", "idle_prompt", "reset"),
@@ -108,6 +105,12 @@ SPEC = [
     ("SubagentStart", None, "agent-start"),
     ("SubagentStop", None, "agent-stop"),
 ]
+
+# Events earlier versions wired and this one does not, so a re-install unwires
+# them. PreToolUse fires before the permission prompt, not after approval, so
+# it never shortened the yellow it was added for — it only doubled the per-tool
+# cost.
+RETIRED = ["PreToolUse"]
 
 # Events newer than the oldest Claude Code this supports. What an older Claude
 # Code does with an unknown hook event is untested here, so do not hand it one.
@@ -150,7 +153,7 @@ hooks = data.get("hooks") or {}
 # Strip our previous entries so re-running never stacks duplicates. On install
 # only touch events we are about to rewire: an event we do not ship (someone's
 # hand-wired PreCompact, say) is theirs to keep. Uninstall clears all of them.
-scope = [e for e, _, _ in SPEC] if mode == "install" else list(hooks)
+scope = [e for e, _, _ in SPEC] + RETIRED if mode == "install" else list(hooks)
 for event in scope:
     groups = []
     for group in hooks.get(event, []):

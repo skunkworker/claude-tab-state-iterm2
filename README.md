@@ -6,7 +6,7 @@ or idle.
 
 | Tab color | Meaning | Hook event |
 |-----------|---------|------------|
-| 🟢 green  | Claude is running | `UserPromptSubmit`, `PreToolUse`, `PostToolUse` |
+| 🟢 green  | Claude is running | `UserPromptSubmit`, `PostToolUse` |
 | 🔵 blue   | waiting for subagents | `SubagentStart` / `SubagentStop` |
 | 🟡 yellow | Claude needs you (permission / question) | `Notification` (`permission_prompt`) |
 | default   | done / idle / session over | `Stop`, `StopFailure`, `SessionEnd`, `SessionStart` |
@@ -47,7 +47,6 @@ If you would rather wire it by hand, add this to `~/.claude/settings.json`:
 ```json
 "hooks": {
   "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh start" }] }],
-  "PreToolUse":       [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh green" }] }],
   "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh green" }] }],
   "Notification": [
     { "matcher": "permission_prompt", "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh yellow" }] },
@@ -176,9 +175,11 @@ almost nothing per tool call.
   Clearing a tab that turns out to still be working costs nothing: its next
   tool call repaints it.
 
-- **Why `PreToolUse` too.** `PostToolUse` fires when a tool *finishes*. Without
-  `PreToolUse`, approving a three-minute test run leaves the tab yellow for the
-  whole run, claiming it needs you when it doesn't.
+- **Why not `PreToolUse`.** It used to be wired, on the theory that approving a
+  three-minute test run otherwise leaves the tab yellow for the whole run. It
+  never helped: `PreToolUse` fires *before* the permission prompt, and no hook
+  fires on approval, so the yellow lasts until `PostToolUse` either way. It
+  only doubled the cost of every tool call. `install.sh` unwires it.
 
 ## Requirements and limits
 

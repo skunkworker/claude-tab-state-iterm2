@@ -33,6 +33,10 @@ version, so the date something landed is the useful thing to know.
 
 ### Changed
 
+- **`PreToolUse` is no longer wired.** It was added so that approving a long
+  tool call would not leave the tab yellow for the whole run. But it fires
+  before the permission prompt, and no hook fires on approval, so it never did
+  that — it only doubled the per-tool cost. Re-running `install.sh` unwires it.
 - Subagent tokens are empty files aged by mtime, so `agent-start` no longer
   forks `date`, and the agent events no longer sweep at all.
 

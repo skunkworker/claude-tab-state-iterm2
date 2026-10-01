@@ -69,7 +69,7 @@ chmod +x "$SANDBOX/probe.sh"
 python3 - "$SANDBOX/probe.sh" >"$SANDBOX/settings.json" <<'PY'
 import json, sys
 probe = sys.argv[1]
-events = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
+events = ["SessionStart", "UserPromptSubmit", "PostToolUse",
           "SubagentStart", "SubagentStop", "Stop", "SessionEnd"]
 hooks = {e: [{"hooks": [{"type": "command",
                          "command": "bash %s %s" % (probe, e)}]}] for e in events}
@@ -135,8 +135,8 @@ check(bool(sid) and sid == pid, "the two agent_ids agree",
 
 print()
 print("other events driving the colors")
-for event in ("SessionStart", "UserPromptSubmit", "PreToolUse",
-              "PostToolUse", "Stop", "SessionEnd"):
+for event in ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop",
+              "SessionEnd"):
     check(event in seen, "%s fires" % event)
 
 # The point of this stage: our own parser, against the payload as shipped today

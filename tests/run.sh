@@ -694,7 +694,7 @@ if it "a stranded yellow tab is cleared once its session is gone"; then
 fi
 
 if it "the hot path leaves sweeping to the turn end"; then
-  # The sweep costs a fork; PreToolUse and PostToolUse run constantly.
+  # The sweep costs a fork; PostToolUse runs constantly.
   other=$(strand "$(dead_pid)" busy)
   "$TAB_STATE" start
   "$TAB_STATE" green
@@ -780,7 +780,7 @@ print(sum(1 for gs in d.get("hooks",{}).values() for g in gs
 if it "install wires every event"; then
   seed_settings
   "$INSTALL" >/dev/null 2>&1
-  check "$CURRENT" "11" "$(count_hooks tab-state.sh)"
+  check "$CURRENT" "10" "$(count_hooks tab-state.sh)"
 fi
 
 if it "install wires both Notification matchers"; then
@@ -829,6 +829,26 @@ PY
     "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["hooks"].get("PreCompact",[])))' "$SETTINGS")"
 fi
 
+if it "install unwires PreToolUse left by an older install"; then
+  # It fires before the permission prompt, so it never shortened the yellow it
+  # was added for. A re-install must take it out, and only our entry.
+  seed_settings
+  python3 - "$SETTINGS" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["hooks"]["PreToolUse"].append({"hooks": [
+    {"type": "command", "command": "bash ~/.claude/tab-state.sh green"}]})
+json.dump(d, open(p, "w"))
+PY
+  "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT (ours gone)" "0" \
+    "$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print(sum("tab-state" in h["command"] for g in d["hooks"]["PreToolUse"] for h in g["hooks"]))' "$SETTINGS")"
+  check "$CURRENT (foreign kept)" "1" "$(count_hooks unrelated-tool)"
+fi
+
 if it "install does not claim a wrapper that merely mentions the path"; then
   cat >"$SETTINGS" <<'JSON'
 {"hooks":{"Stop":[{"hooks":[{"type":"command","command":"my-wrapper.sh --then tab-state.sh reset"}]}]}}
@@ -842,7 +862,7 @@ if it "install is idempotent"; then
   "$INSTALL" >/dev/null 2>&1
   "$INSTALL" >/dev/null 2>&1
   "$INSTALL" >/dev/null 2>&1
-  check "$CURRENT (ours)" "11" "$(count_hooks tab-state.sh)"
+  check "$CURRENT (ours)" "10" "$(count_hooks tab-state.sh)"
   check "$CURRENT (foreign)" "1" "$(count_hooks unrelated-tool)"
   check "$CURRENT (one backup)" "1" "$(find "$HOME/.claude" -name 'settings.json.bak*' | wc -l | tr -d ' ')"
 fi
@@ -919,7 +939,7 @@ if it "install skips the subagent events on Claude Code older than 2.0.43"; then
   seed_settings
   PATH="$(fake_claude 2.0.42)" "$INSTALL" >/dev/null 2>&1
   check "$CURRENT (skipped)" "0" "$(count_hooks agent-start)"
-  check "$CURRENT (rest wired)" "8" "$(count_hooks tab-state.sh)"
+  check "$CURRENT (rest wired)" "7" "$(count_hooks tab-state.sh)"
 fi
 
 # An API error ends the turn with StopFailure and no Stop, so without it a rate
@@ -958,7 +978,7 @@ if it "install follows a symlinked settings.json"; then
   ln -s "$real" "$SETTINGS"
   "$INSTALL" >/dev/null 2>&1
   check "$CURRENT (still a link)" "$real" "$(readlink "$SETTINGS")"
-  check "$CURRENT (target rewritten)" "11" \
+  check "$CURRENT (target rewritten)" "10" \
     "$(python3 -c 'import json,sys
 d=json.load(open(sys.argv[1]))
 print(sum(1 for gs in d.get("hooks",{}).values() for g in gs
