@@ -3,6 +3,47 @@
 Dated entries, newest first. This is a personal tool with no releases to
 version, so the date something landed is the useful thing to know.
 
+## 2026-09-30
+
+### Fixed
+
+- **An API error left the tab green.** A turn that ends on a rate limit or an
+  overload sends `StopFailure`, not `Stop`, so nothing reset the tab. It is now
+  wired to `reset` on Claude Code 2.1.78 and newer. The version gate moved into
+  the Python merge as a per-event table, so the next gated event is one line.
+- **A lost `SubagentStop` held a tab blue forever.** Caught live: a token from
+  10:22 still held `ttys004` blue at 16:28, its session alive. Two gaps lined
+  up. The 2h token sweep ran only on agent events, and that tab never saw
+  another one. And the foreign sweep spared blue tabs by name, with no bound.
+  Now every turn end, in any tab, drops aged tokens with one `find`, and blue
+  is exempt only while a token still backs it.
+- **Toggling off and on reopened every turn.** The latch marked a turn
+  *closed*, and the toggle drained those markers, so after `toggle.sh on` the
+  next post-turn tool hook (an away summary) painted the tab green for good.
+  The latch now marks the turn *open* (`open-<tty>`, written by `start`), so
+  lost state reads as closed. It exists only during a turn, which also ends the
+  `stopped-*` files that used to pile up forever — delete old ones with
+  `rm ~/.claude/.tab-state/stopped-*`.
+- **A `claude -p` run inside a session reset its parent's tab.** The Bash tool's
+  shell has no tty, so the tty walk went straight past the nested `claude` to
+  the parent session's tab, and the nested `SessionStart` reset it and dropped
+  its subagents mid-turn. The walk now asks `ps` for `comm` in the same call
+  and stops at a `claude` with no tty. `tests/probe-hooks.sh` was one way to
+  hit it; its claim never to read `~/.claude` was also wrong and is corrected.
+
+### Changed
+
+- **`PreToolUse` is no longer wired.** It was added so that approving a long
+  tool call would not leave the tab yellow for the whole run. But it fires
+  before the permission prompt, and no hook fires on approval, so it never did
+  that — it only doubled the per-tool cost. Re-running `install.sh` unwires it.
+- `toggle.sh off` drains through `tab-state.sh` rather than its own copy of
+  the loop, which had already drifted (it kept live records). The disabled
+  check moved above the iTerm2 and tmux guards to make that work from any
+  terminal: those guard the terminal running the hook, not the tabs drained.
+- Subagent tokens are empty files aged by mtime, so `agent-start` no longer
+  forks `date`, and the agent events no longer sweep at all.
+
 ## 2026-08-12
 
 ### Fixed

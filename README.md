@@ -6,10 +6,10 @@ or idle.
 
 | Tab color | Meaning | Hook event |
 |-----------|---------|------------|
-| 🟢 green  | Claude is running | `UserPromptSubmit`, `PreToolUse`, `PostToolUse` |
+| 🟢 green  | Claude is running | `UserPromptSubmit`, `PostToolUse` |
 | 🔵 blue   | waiting for subagents | `SubagentStart` / `SubagentStop` |
 | 🟡 yellow | Claude needs you (permission / question) | `Notification` (`permission_prompt`) |
-| default   | done / idle / session over | `Stop`, `SessionEnd`, `SessionStart` |
+| default   | done / idle / session over | `Stop`, `StopFailure`, `SessionEnd`, `SessionStart` |
 
 Blue outranks green: while any subagent is outstanding the tab stays blue even
 as the parent keeps calling tools, and it stays blue after `Stop` — subagents
@@ -32,9 +32,9 @@ only the exact commands it generates, and leaves every other hook alone — so
 re-running it is safe and never stacks duplicates.
 
 The blue subagent state needs Claude Code **2.0.43 or newer** (`SubagentStart`
-and the `agent_id` hook field). `install.sh` checks `claude --version` and
-simply leaves those two events unwired on anything older; every other color
-still works.
+and the `agent_id` hook field), and `StopFailure` needs **2.1.78**. `install.sh`
+checks `claude --version` and simply leaves an event unwired on anything older
+than it needs; every other color still works.
 
 ```sh
 ./install.sh --dry-run     # show what would change, touch nothing
@@ -47,13 +47,13 @@ If you would rather wire it by hand, add this to `~/.claude/settings.json`:
 ```json
 "hooks": {
   "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh start" }] }],
-  "PreToolUse":       [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh green" }] }],
   "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh green" }] }],
   "Notification": [
     { "matcher": "permission_prompt", "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh yellow" }] },
     { "matcher": "idle_prompt",       "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh reset" }] }
   ],
   "Stop":             [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh reset" }] }],
+  "StopFailure":      [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh reset" }] }],
   "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh session" }] }],
   "SessionStart":     [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh session" }] }],
   "SubagentStart":    [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh agent-start" }] }],
@@ -95,6 +95,8 @@ almost nothing per tool call.
   version "never changed colors"). The script walks up the process tree from
   `$PPID` to the parent `claude` process and writes to its real `/dev/ttysNNN`.
   Each session resolves its own tty, so multiple instances color the right tab.
+  The walk stops at a `claude` with no tty: that is a headless `claude -p` run
+  from inside another session, and the tab further up belongs to the parent.
   The walk asks each level for `ppid` and `tty` in one `ps`, which matters
   because it runs on every `PostToolUse`. A single full-table `ps -ax` snapshot
   needs fewer processes but measures about twice as slow — it resolves the tty
@@ -114,16 +116,26 @@ almost nothing per tool call.
   race between the hooks of agents starting and finishing at the same moment.
   Tokens are keyed by tty as well, so a second session in another tab cannot
   color yours. If a `SubagentStop` never arrives, session boundaries drain the
-  set and a staleness sweep is the backstop.
+  set, and every turn end — in any tab — drops tokens older than the TTL. The
+  token is an empty file whose mtime is its start time. The sweep used to run
+  only on agent events, so a tab that never saw another one stayed blue for
+  good; that was caught live, six hours after the lost `SubagentStop`.
 
-- **Not getting stuck.** `Stop` does not fire when you interrupt, quit, or
-  crash, which used to leave the tab green with nothing behind it — hence
-  `SessionEnd`. And with parallel tool calls a slow `PostToolUse` green can
-  land *after* `Stop`'s reset. Nothing in the payload can order those two, so
-  `reset` closes the turn and `start` reopens it: green does not paint in
-  between. The latch is still a check followed by a paint, so `green` re-reads
-  it afterwards — a `Stop` that slips between the two would otherwise be
-  painted over by a green nobody is coming back to undo.
+- **Not getting stuck.** `Stop` does not fire when the turn ends on an API error
+  — Claude Code sends `StopFailure` instead, so both reset. Nor does it fire
+  when you quit, which used to leave the tab green with nothing behind it —
+  hence `SessionEnd`; a crash sends nothing and is left to the sweep below. An
+  interrupt (Esc) sends neither `Stop` nor `SessionEnd`, so that tab stays green
+  until your next prompt, the idle nudge, or the sweep. And with parallel tool
+  calls a slow `PostToolUse` green can land *after* `Stop`'s reset. Nothing in
+  the payload can order those two, so `reset` closes the turn and `start`
+  reopens it: green does not paint in between. The latch file marks the turn
+  *open*, so lost state — a toggle, a drained state dir — reads as closed: dark
+  until your next prompt, never green for good. An earlier version marked it
+  closed, and toggling the feature off and on reopened every tab's latch. The
+  latch is still a check followed by a paint, so `green` re-reads it afterwards
+  — a `Stop` that slips between the two would otherwise be painted over by a
+  green nobody is coming back to undo.
 
 - **Why the latch has no expiry.** It used to lapse after 60s, so that a
   session resumed without a `start` healed rather than staying dark. That
@@ -156,15 +168,18 @@ almost nothing per tool call.
   that is the guarantee — the next `claude` you start in any tab heals the
   others. Turn ends sweep as well, which only shortens the wait. An owner still
   alive keeps its tab unless its record has been `busy` and untouched for 30
-  minutes, since every tool call rewrites it — waiting on you (yellow) or on a
-  subagent (blue) is exempt *by name*, both being legitimately long-lived, so a
-  state added later ages out rather than silently becoming un-healable.
+  minutes, since every tool call rewrites it — waiting on you (yellow) is
+  exempt *by name*, and so is blue while a subagent token still backs it, both
+  being legitimately long-lived. A state added later ages out rather than
+  silently becoming un-healable.
   Clearing a tab that turns out to still be working costs nothing: its next
   tool call repaints it.
 
-- **Why `PreToolUse` too.** `PostToolUse` fires when a tool *finishes*. Without
-  `PreToolUse`, approving a three-minute test run leaves the tab yellow for the
-  whole run, claiming it needs you when it doesn't.
+- **Why not `PreToolUse`.** It used to be wired, on the theory that approving a
+  three-minute test run otherwise leaves the tab yellow for the whole run. It
+  never helped: `PreToolUse` fires *before* the permission prompt, and no hook
+  fires on approval, so the yellow lasts until `PostToolUse` either way. It
+  only doubled the cost of every tool call. `install.sh` unwires it.
 
 ## Requirements and limits
 
@@ -176,14 +191,14 @@ almost nothing per tool call.
   removed: every pane shares one iTerm2 tab, so the signal cannot mean what it
   means everywhere else.
 - **No dependencies beyond bash.** `install.sh` needs `python3` to edit
-  `settings.json`; `tab-state.sh` itself shells out only to `ps` and `date`.
+  `settings.json`; `tab-state.sh` itself shells out only to `ps` and `find`.
 
 ## Customizing
 
 - **Colors:** edit the `set_color R G B` values in `tab-state.sh` (0–255).
 - **Subagent staleness:** `TAB_STATE_AGENT_TTL_SEC` (default 7200, i.e. 2h) is
-  how long a subagent whose `SubagentStop` never arrived is believed. Raise it
-  if you run longer agents than that.
+  how long a subagent whose `SubagentStop` never arrived is believed, rounded
+  up to whole minutes. Raise it if you run longer agents than that.
 - **Abandoned-tab timeout:** `TAB_STATE_BUSY_TTL_MIN` (default 30 minutes) is
   how long a green tab may go without a hook event before another tab's turn
   end clears it. Raise it if you routinely run single tool calls longer than

@@ -20,9 +20,9 @@
 # Hooks run in a subprocess with NO controlling terminal, so /dev/tty fails.
 # We walk up the process tree to the parent `claude` process's real tty.
 #
-# This runs on every PreToolUse and PostToolUse, so the cost of a single call
-# is the design constraint throughout: guards are ordered cheapest-first and
-# everything below them avoids forking where bash can do the job.
+# This runs on every PostToolUse, so the cost of a single call is the design
+# constraint throughout: guards are ordered cheapest-first and everything below
+# them avoids forking where bash can do the job.
 #
 # Env overrides (mainly for tests and unusual setups):
 #   TAB_STATE_DEV            write escapes here instead of resolving a tty
@@ -36,10 +36,11 @@ RESET_SEQ='\033]6;1;bg;*;default\007'
 DISABLE_FLAG="${HOME:-}/.claude/tab-state.disabled"
 STATE_DIR="${HOME:-}/.claude/.tab-state"
 
-# Backstop for a subagent whose SubagentStop never arrives (it errored, or the
-# session died). Generous: a long research subagent must not be swept while it
-# is still working. Session boundaries drain the whole set anyway.
-AGENT_STALE_AFTER="${TAB_STATE_AGENT_TTL_SEC:-7200}"
+# Backstop for a subagent whose SubagentStop never arrives (it errored, was
+# interrupted, or the session died). Generous: a long research subagent must not
+# be swept while it is still working. Session boundaries drain the whole set
+# anyway. Seconds for compatibility; `find -mmin` wants minutes, rounded up.
+AGENT_TTL_MIN=$(((${TAB_STATE_AGENT_TTL_SEC:-7200} + 59) / 60))
 
 # How long a tab may stay painted busy with nothing refreshing its registry
 # record before another tab's turn end clears it. Every tool call rewrites the
@@ -53,15 +54,22 @@ BUSY_TTL_MIN="${TAB_STATE_BUSY_TTL_MIN:-30}"
 # the `claude` process itself, since hook subprocesses have no controlling
 # terminal). Globals rather than stdout: two values, and no subshell fork.
 #
-# One `ps` per level, asking for both fields at once. A single full-table
+# One `ps` per level, asking for every field at once. A single full-table
 # `ps -ax` snapshot needs fewer forks but measures ~2x slower: it resolves the
 # tty name of every process on the machine. Depth to `claude` is ~3.
+#
+# A `claude` with no tty is a headless session nested inside another one — a
+# `claude -p` run from the Bash tool, whose shell has no tty either. Walking
+# past it lands on the parent session's tab, and the nested SessionStart would
+# then reset that tab and drop its subagents mid-turn. It has no tab of its
+# own, so stop there. (An npm install runs as `node`, which this cannot tell
+# apart; that case walks on as before.)
 resolve_dev() {
-  local pid=$PPID line ppid tty
+  local pid=$PPID line ppid tty comm
   for _ in 1 2 3 4 5 6 7 8; do
-    line=$(ps -o ppid=,tty= -p "$pid" 2>/dev/null) || return 1
+    line=$(ps -o ppid=,tty=,comm= -p "$pid" 2>/dev/null) || return 1
     [ -n "$line" ] || return 1
-    read -r ppid tty <<<"$line"
+    read -r ppid tty comm <<<"$line"
     case "$tty" in
       ttys*)
         dev="/dev/$tty"
@@ -69,6 +77,7 @@ resolve_dev() {
         return 0
         ;;
     esac
+    [ "${comm##*/}" = claude ] && return 1
     [ -n "$ppid" ] && [ "$ppid" != 0 ] || return 1
     pid=$ppid
   done
@@ -104,48 +113,57 @@ unregister_tty() { rm -f "$TTY_RECORD" 2>/dev/null; }
 forget_tty() { # tty
   [ -w "$1" ] && printf '%b' "$RESET_SEQ" >"$1" 2>/dev/null
   local key=${1##*/}
-  rm -f "${STATE_DIR}/tty-$key" "${STATE_DIR}/stopped-$key" "${STATE_DIR}/agent-$key-"* 2>/dev/null
+  rm -f "${STATE_DIR}/tty-$key" "${STATE_DIR}/open-$key" "${STATE_DIR}/agent-$key-"* 2>/dev/null
 }
 
-# True while the turn is closed. `reset` closes it, `start` reopens it — a
-# latch, because nothing in the payload can order a PostToolUse green against
-# the Stop that races it. No expiry: Claude Code's own post-turn model work
-# (away summaries, titling) fires tool hooks minutes later with no `Stop`
-# behind them, so any window lets one repaint a finished tab green for good.
-turn_is_closed() { [ -e "$STOP_MARKER" ]; }
-
-# States that legitimately outlive the turn that painted them: a subagent and an
-# unanswered permission prompt are both long-lived. One predicate for both the
-# foreign sweep and our own tab, so the two cannot drift apart. Testing by name
-# rather than sweeping by name is deliberate — a state added later ages out like
-# `busy` instead of silently becoming un-healable.
-outlives_turn() { [ "$1" = agents ] || [ "$1" = hold ]; }
+# True while the turn is closed. `start` opens it, `reset` closes it — a latch,
+# because nothing in the payload can order a PostToolUse green against the Stop
+# that races it. No expiry: Claude Code's own post-turn model work (away
+# summaries, titling) fires tool hooks minutes later with no `Stop` behind
+# them, so any window lets one repaint a finished tab green for good.
+#
+# The marker records "open", not "closed", so that lost state — a drained state
+# dir, a toggle, an upgrade — lands on the safe side. A closed turn that should
+# have been open costs a dark tab until the next prompt; the reverse is a tab
+# green for good. It also exists only during a turn, so nothing accumulates.
+turn_is_closed() { [ ! -e "$OPEN_MARKER" ]; }
 
 # One token file per outstanding subagent, keyed by the agent_id that both
 # SubagentStart and SubagentStop carry. Counting in a shared file would be a
 # read-modify-write race between the hook processes of agents that start and
-# finish concurrently; a glob has no such problem and needs no locking.
-agents_running() { # fork-free: the hot path only asks "any?"
+# finish concurrently; a glob has no such problem and needs no locking. The
+# file is empty: its mtime is the start time, which is all the sweep reads.
+agents_running() { # [glob-prefix] — fork-free: the hot path only asks "any?"
   local f
-  for f in "$AGENT_GLOB"*; do
+  for f in "${1:-$AGENT_GLOB}"*; do
     [ -e "$f" ] && return 0
     break
   done
   return 1
 }
 
-# Swept only on the rare agent events, never on the hot path. The fork-free
-# "any?" first, so an empty set costs no `date`.
+# States that legitimately outlive the turn that painted them: an unanswered
+# permission prompt, and blue for as long as a subagent token backs it. One
+# predicate for both the foreign sweep and our own tab, so the two cannot drift
+# apart. Testing by name rather than sweeping by name is deliberate — a state
+# added later ages out like `busy` instead of silently becoming un-healable.
+# Blue is tied to its tokens rather than exempt outright, so a lost
+# SubagentStop ends when the token ages out instead of never.
+outlives_turn() { # state tty-key
+  case "$1" in
+    hold) return 0 ;;
+    agents) agents_running "${STATE_DIR}/agent-$2-" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Drop every tab's subagent tokens older than the TTL. Here rather than on the
+# agent events because a tab whose SubagentStop never came may never see another
+# agent event. The fork-free probe first, so a turn with no agents anywhere
+# costs no `find`.
 sweep_agents() {
-  local f stamped now
-  agents_running || return 0
-  now=$(date +%s 2>/dev/null) || return 0
-  for f in "$AGENT_GLOB"*; do
-    [ -e "$f" ] || continue
-    read -r stamped 2>/dev/null <"$f" || stamped=0
-    [ $((now - ${stamped:-0})) -ge "$AGENT_STALE_AFTER" ] && rm -f "$f" 2>/dev/null
-  done
-  return 0
+  agents_running "$STATE_DIR/agent-" || return 0
+  find "$STATE_DIR" -maxdepth 1 -name 'agent-*' -mmin "+$AGENT_TTL_MIN" -delete 2>/dev/null
 }
 
 # Clear tabs no hook will ever come back for, and drop what they left behind.
@@ -157,6 +175,7 @@ sweep_agents() {
 # nothing: its next tool call repaints and re-registers it.
 heal_registry() {
   local f d o s stale=""
+  sweep_agents
   for f in "$STATE_DIR"/tty-*; do
     [ -e "$f" ] || continue
     read -r d o s 2>/dev/null <"$f" || continue
@@ -164,7 +183,7 @@ heal_registry() {
     # A record with no owner predates this format; treat it as unowned. A tty
     # that is gone skips the question entirely — forget_tty writes nothing.
     if [ -w "$d" ] && [ -n "$o" ] && kill -0 "$o" 2>/dev/null; then
-      outlives_turn "$s" && continue
+      outlives_turn "$s" "${d##*/}" && continue
       # One fork for the whole sweep, and only once a live-owner record has
       # actually asked. `-mmin` lists the aged records, so the test itself stays
       # fork-free; the newline sentinels make an empty result non-empty, which
@@ -232,6 +251,35 @@ case "${1:-}" in
     ;;
 esac
 
+# Feature off: clear anything we painted and get out. Deliberately above
+# resolve_dev, which is the most expensive thing this script does and is pure
+# waste for a disabled feature. Fork-free once the state has been drained.
+#
+# Above the terminal guards too: those are about the terminal running this
+# hook, while the drain only writes to tabs iTerm2 already showed our color in.
+# That is also what lets toggle.sh drain through here from any terminal rather
+# than keep a second copy of this loop.
+#
+# Subagent tokens go too. This arm swallows the SubagentStop that would have
+# removed them, so leaving them behind means re-enabling paints blue for an
+# agent that finished while the feature was off. Open-turn markers go so that
+# every turn is closed on re-enable — the safe side.
+if [ -e "$DISABLE_FLAG" ]; then
+  for f in "$STATE_DIR"/tty-*; do
+    [ -e "$f" ] || continue
+    read -r d _ 2>/dev/null <"$f" || continue
+    forget_tty "$d"
+  done
+  # The loop is a fork-free probe for leftovers no registry entry named; one
+  # `rm` then drains both classes, rather than one per file.
+  for f in "$STATE_DIR"/agent-* "$STATE_DIR"/open-*; do
+    [ -e "$f" ] || continue
+    rm -f "$STATE_DIR"/agent-* "$STATE_DIR"/open-* 2>/dev/null
+    break
+  done
+  exit 0
+fi
+
 # Unsupported terminals render OSC 6 as literal garbage in the scrollback, so
 # stay silent unless we know we are talking to iTerm2.
 if [ "${TAB_STATE_FORCE:-}" != 1 ] &&
@@ -244,29 +292,6 @@ fi
 # signal cannot mean what it means everywhere else.
 [ -n "${TMUX:-}${STY:-}" ] && exit 0
 
-# Feature off: clear anything we painted and get out. Deliberately above
-# resolve_dev, which is the most expensive thing this script does and is pure
-# waste for a disabled feature. Fork-free once the state has been drained.
-#
-# Subagent tokens go too. This arm swallows the SubagentStop that would have
-# removed them, so leaving them behind means re-enabling paints blue for an
-# agent that finished while the feature was off.
-if [ -e "$DISABLE_FLAG" ]; then
-  for f in "$STATE_DIR"/tty-*; do
-    [ -e "$f" ] || continue
-    read -r d _ 2>/dev/null <"$f" || continue
-    forget_tty "$d"
-  done
-  # The loop is a fork-free probe for leftovers no registry entry named; one
-  # `rm` then drains both classes, rather than one per file.
-  for f in "$STATE_DIR"/agent-* "$STATE_DIR"/stopped-*; do
-    [ -e "$f" ] || continue
-    rm -f "$STATE_DIR"/agent-* "$STATE_DIR"/stopped-* 2>/dev/null
-    break
-  done
-  exit 0
-fi
-
 owner=$PPID              # stands in when TAB_STATE_DEV skips the walk
 dev="${TAB_STATE_DEV:-}" # doubles as the initializer resolve_dev may not set
 [ -n "$dev" ] || resolve_dev
@@ -275,7 +300,7 @@ dev="${TAB_STATE_DEV:-}" # doubles as the initializer resolve_dev may not set
 # Every record this tab owns is keyed by its tty name, derived once here.
 key=${dev##*/}
 TTY_RECORD="${STATE_DIR}/tty-$key"
-STOP_MARKER="${STATE_DIR}/stopped-$key"
+OPEN_MARKER="${STATE_DIR}/open-$key"
 AGENT_GLOB="${STATE_DIR}/agent-$key-"
 [ -d "$STATE_DIR" ] || mkdir -p "$STATE_DIR" 2>/dev/null
 
@@ -283,8 +308,9 @@ AGENT_GLOB="${STATE_DIR}/agent-$key-"
 
 case "$state" in
   start)
-    # UserPromptSubmit: the turn is open by definition, so reopen the latch.
-    rm -f "$STOP_MARKER" 2>/dev/null
+    # UserPromptSubmit: the turn is open by definition. A flag, not a clock:
+    # nothing reads its contents, so a bare redirect rather than a `date` fork.
+    : >"$OPEN_MARKER" 2>/dev/null
     paint_busy
     ;;
   green)
@@ -294,7 +320,7 @@ case "$state" in
       # registered in a state that should not have survived the turn, this is
       # the last hook that will ever visit, so it clears it instead.
       read -r _ _ shown 2>/dev/null <"$TTY_RECORD" &&
-        ! outlives_turn "$shown" && reset_color
+        ! outlives_turn "$shown" "$key" && reset_color
       exit 0
     fi
     paint_busy
@@ -306,9 +332,11 @@ case "$state" in
     paint hold 235 190 0
     ;;
   reset)
-    # The marker is a flag, not a clock: nothing reads its contents, so it is
-    # written with a bare redirect rather than a `date` fork.
-    : >"$STOP_MARKER" 2>/dev/null
+    rm -f "$OPEN_MARKER" 2>/dev/null
+    # Once a turn, off the hot path: the only chance a stranded tab in another
+    # terminal has of being cleaned up. First, so the stale-token sweep inside
+    # it also decides our own color below.
+    heal_registry
     # Subagents outlive the turn that dispatched them, so a finished turn with
     # work still outstanding stays blue rather than going dark.
     if agents_running; then
@@ -316,9 +344,6 @@ case "$state" in
     else
       reset_color
     fi
-    # Once a turn, off the hot path: the only chance a stranded tab in another
-    # terminal has of being cleaned up.
-    heal_registry
     ;;
   session)
     # A compact is not a boundary: `SessionStart` fires for it, but the turn
@@ -329,8 +354,7 @@ case "$state" in
     json_field source
     if [ "$FIELD" != compact ]; then
       # Any other boundary is the one point where nothing can still be running.
-      rm -f "$AGENT_GLOB"* 2>/dev/null
-      : >"$STOP_MARKER" 2>/dev/null
+      rm -f "$AGENT_GLOB"* "$OPEN_MARKER" 2>/dev/null
       reset_color
     fi
     heal_registry
@@ -339,8 +363,7 @@ case "$state" in
     read_payload
     json_field agent_id
     [ -n "$FIELD" ] || exit 0
-    sweep_agents
-    date +%s >"${AGENT_GLOB}${FIELD//[^A-Za-z0-9_-]/_}" 2>/dev/null
+    : >"${AGENT_GLOB}${FIELD//[^A-Za-z0-9_-]/_}" 2>/dev/null
     paint_agents
     ;;
   agent-stop)
@@ -348,7 +371,6 @@ case "$state" in
     json_field agent_id
     [ -n "$FIELD" ] || exit 0
     rm -f "${AGENT_GLOB}${FIELD//[^A-Za-z0-9_-]/_}" 2>/dev/null
-    sweep_agents
     # Hand the tab back to whatever the turn is actually doing.
     if agents_running; then
       paint_agents

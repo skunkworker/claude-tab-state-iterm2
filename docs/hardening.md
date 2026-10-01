@@ -89,11 +89,24 @@ narrower door. The re-validation now lives inside `paint_busy`
 `[ "$state" = green ]` dispatch-name test — the tell that the fix had been at
 the wrong altitude — is gone with it.
 
+### Four gaps found in a review (fixed 2026-09-30)
+
+- **A lost `SubagentStop` held a tab blue forever** — live on `ttys004`, six
+  hours after the token was written. The token sweep only ran on agent events,
+  and the foreign sweep exempted blue by name with no bound. Tokens now age by
+  mtime, every turn end sweeps them, and blue is exempt only while a token
+  backs it.
+- **`StopFailure` was not wired**, so an API error left the tab green.
+- **Toggling off and on reopened every latch**, since the marker recorded
+  "closed" and the toggle drained it. The marker now records "open".
+- **A nested `claude -p` reset its parent's tab** — the tty walk went past the
+  tty-less nested session. The walk now stops at a `claude` with no tty.
+
 ## Open
 
 ### 1. `kill -0` proves a pid exists, not that it is your session
 
-`tab-state.sh:166`
+`tab-state.sh:190` (as of 2026-09-30)
 
 macOS recycles pids. A recycled owner makes a dead session's tab **immortal**:
 the sweep sees a live owner, and the record either sits in an exempt state or
@@ -107,7 +120,7 @@ read time but needs one at write time.
 
 ### 2. Record writes are not atomic
 
-`tab-state.sh:96`
+`tab-state.sh:105` (as of 2026-09-30)
 
 `register_tty` redirects with `>`, which is `O_TRUNC`, so a foreign sweep
 running concurrently during parallel tool calls can read a zero-length or
@@ -118,3 +131,16 @@ is luck rather than design, and a future reader of a partial record might not be
 so lucky. Either write to a temp file and `mv` it into place (one extra fork on
 the hot path, probably not worth it), or leave it and document that every reader
 must treat a short read as "skip", which is the cheap and honest option.
+
+### 3. Edge cases with no clean signal
+
+- **Yellow erased by other agents.** While one subagent waits on a permission
+  prompt, tool hooks from the main thread or other subagents repaint green or
+  blue. No payload field ties the prompt to its tool call.
+- **Background-agent wake-up runs dark.** When a background subagent finishes
+  after the turn ended, Claude Code wakes the main agent. If that wake-up sends
+  no `UserPromptSubmit`, its tool hooks see a closed latch and the tab stays
+  dark until `Stop`. The accepted false-dark trade-off, but now a common path
+  since subagents default to background (v2.1.198). Worth a probe case.
+- **Interrupt (Esc)** sends neither `Stop` nor `SessionEnd`. The tab stays
+  green until the next prompt, the idle nudge, or the 30-minute foreign sweep.

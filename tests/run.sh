@@ -39,7 +39,7 @@ setup() {
   : >"$TAB_STATE_DEV"
   STATE_DIR="$HOME/.claude/.tab-state"
   REGISTRY="$STATE_DIR/tty-out"
-  MARKER="$STATE_DIR/stopped-out"
+  MARKER="$STATE_DIR/open-out"
   DISABLED="$HOME/.claude/tab-state.disabled"
   SETTINGS="$HOME/.claude/settings.json"
 }
@@ -123,13 +123,19 @@ paints() { # state expected
   "$TAB_STATE" "$1"
   check "$CURRENT" "$2" "$(out)"
 }
-paints green "$GREEN"
 paints start "$GREEN"
 paints reset "$DEFAULT"
 
+if it "green paints the tab once a turn is open"; then
+  "$TAB_STATE" start
+  clear_out
+  "$TAB_STATE" green
+  check "$CURRENT" "$GREEN" "$(out)"
+fi
+
 if it "paints without writing to stderr"; then
-  # A missing stop marker is the normal case, so the redirect that reads it
-  # must not leak "No such file or directory" into the hook's stderr.
+  # A missing marker or record is the normal case, so nothing that tests or
+  # reads one may leak "No such file or directory" into the hook's stderr.
   check "$CURRENT (green)" "" "$("$TAB_STATE" green 2>&1 >/dev/null)"
   check "$CURRENT (start)" "" "$("$TAB_STATE" start 2>&1 >/dev/null)"
   check "$CURRENT (reset)" "" "$("$TAB_STATE" reset 2>&1 >/dev/null)"
@@ -185,11 +191,29 @@ if it "the latch never expires"; then
   # the session title — and its tool hooks arrive minutes later with no `start`
   # before them and no `Stop` behind them. Any expiry lets one of those repaint
   # a finished tab green for good, which is exactly what was seen in the wild.
+  # A closed turn is the absence of a file, so there is no clock to run out.
+  "$TAB_STATE" start
   "$TAB_STATE" reset
+  check "$CURRENT (no marker)" "absent" "$(exists "$MARKER")"
   clear_out
-  age "$MARKER" 3600
   "$TAB_STATE" green
   check "$CURRENT" "" "$(out)"
+fi
+
+if it "lost state counts as a closed turn"; then
+  # The marker records "open", so a state dir that was drained, toggled or
+  # never written lands on the safe side: dark until the next prompt, never
+  # green for good.
+  "$TAB_STATE" green
+  check "$CURRENT (fresh)" "" "$(out)"
+  "$TAB_STATE" start
+  "$TAB_STATE" reset
+  "$TOGGLE" off >/dev/null 2>&1
+  "$TOGGLE" on >/dev/null 2>&1
+  clear_out
+  "$TAB_STATE" green # a post-turn tool hook after re-enabling
+  check "$CURRENT (after toggle)" "" "$(out)"
+  check "$CURRENT (unregistered)" "absent" "$(exists "$REGISTRY")"
 fi
 
 if it "start reopens the turn so the next green paints"; then
@@ -206,12 +230,13 @@ if it "a Stop landing mid-paint does not strand the tab green"; then
   # blocks on open until something reads, so the Stop can land mid-brushstroke.
   mkfifo "$SANDBOX/fifo"
   mkdir -p "$STATE_DIR"
+  : >"$STATE_DIR/open-fifo" # the turn is open
   TAB_STATE_DEV="$SANDBOX/fifo" "$TAB_STATE" green &
   painter=$!
   # The record is written immediately before the paint blocks opening the fifo,
   # so it is a precise "past the latch test" signal — better than a fixed sleep.
   while [ ! -e "$STATE_DIR/tty-fifo" ]; do sleep 0.05; done
-  : >"$STATE_DIR/stopped-fifo"
+  rm -f "$STATE_DIR/open-fifo" # the Stop
   # One reader per emit: each opens and closes the fifo, so a single cat would
   # take the first EOF and leave the second write with nowhere to go.
   (
@@ -232,7 +257,7 @@ if it "a green after the turn closed clears a tab left painted"; then
   # It is the last event that tab will ever see, so it heals instead of painting.
   "$TAB_STATE" start
   "$TAB_STATE" green
-  : >"$MARKER" # a Stop whose reset never reached the tab
+  rm -f "$MARKER" # a Stop whose reset never reached the tab
   clear_out
   "$TAB_STATE" green
   check "$CURRENT (cleared)" "$DEFAULT" "$(out)"
@@ -246,7 +271,7 @@ if it "a green after the turn closed heals a state it does not recognize"; then
   "$TAB_STATE" start
   "$TAB_STATE" green
   record "$TAB_STATE_DEV" $$ future-state
-  : >"$MARKER"
+  rm -f "$MARKER"
   clear_out
   "$TAB_STATE" green
   check "$CURRENT" "$DEFAULT" "$(out)"
@@ -256,7 +281,7 @@ if it "a green after the turn closed spares a tab still waiting on you"; then
   # `hold` outlives the turn: an unanswered permission prompt is still true.
   "$TAB_STATE" start
   "$TAB_STATE" yellow
-  : >"$MARKER"
+  rm -f "$MARKER"
   clear_out
   "$TAB_STATE" green
   check "$CURRENT (untouched)" "" "$(out)"
@@ -367,15 +392,34 @@ if it "agent events without an agent_id are ignored"; then
   check "$CURRENT (no token)" "0" "$(agent_count)"
 fi
 
-if it "stale subagent tokens are swept"; then
+if it "a stale subagent token is swept at the turn end"; then
+  # A SubagentStop that never arrived must not strand the tab blue forever —
+  # even when no further agent event ever comes to this tab, as seen in the wild.
   "$TAB_STATE" start
   agent agent-start ag_stuck
-  # A SubagentStop that never arrived must not strand the tab blue forever.
-  printf '%s\n' "$(($(date +%s) - 100000))" >"$STATE_DIR/agent-out-ag_stuck"
+  age "$STATE_DIR/agent-out-ag_stuck" 100000
   clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (default)" "$DEFAULT" "$(out)"
+  check "$CURRENT (swept)" "0" "$(agent_count)"
+fi
+
+if it "a fresh subagent token survives the turn-end sweep"; then
+  "$TAB_STATE" start
   agent agent-start ag_live
-  agent agent-stop ag_live
-  check "$CURRENT (swept)" "$GREEN" "$(out)"
+  age "$STATE_DIR/agent-out-ag_live" 600
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (still blue)" "$BLUE" "$(out)"
+  check "$CURRENT (kept)" "1" "$(agent_count)"
+fi
+
+if it "the subagent timeout is configurable"; then
+  "$TAB_STATE" start
+  agent agent-start ag_live
+  age "$STATE_DIR/agent-out-ag_live" 600
+  TAB_STATE_AGENT_TTL_SEC=300 "$TAB_STATE" reset
+  check "$CURRENT" "0" "$(agent_count)"
 fi
 
 if it "an agent_id cannot escape the state directory"; then
@@ -388,7 +432,7 @@ fi
 # --------------------------------------------------------------- disable flag
 
 if it "the disable flag clears painted tabs and drains the registry"; then
-  "$TAB_STATE" green
+  "$TAB_STATE" start
   : >"$DISABLED"
   clear_out
   "$TAB_STATE" green
@@ -424,13 +468,13 @@ if it "toggle off forgets outstanding subagents"; then
 fi
 
 if it "session reaps records for ttys that are gone"; then
-  "$TAB_STATE" green
+  "$TAB_STATE" start
   # A live owner, but a tty that is gone — which outranks it.
   record "$SANDBOX/vanished" $$ busy
-  : >"$STATE_DIR/stopped-vanished"
+  : >"$STATE_DIR/open-vanished"
   "$TAB_STATE" session </dev/null
   check "$CURRENT (dead tty gone)" "absent" "$(exists "$STATE_DIR/tty-vanished")"
-  check "$CURRENT (its marker gone)" "absent" "$(exists "$STATE_DIR/stopped-vanished")"
+  check "$CURRENT (its marker gone)" "absent" "$(exists "$STATE_DIR/open-vanished")"
 fi
 
 if it "the disable flag stays silent once nothing is painted"; then
@@ -443,30 +487,65 @@ fi
 
 if it "stays silent outside iTerm2"; then
   unset TAB_STATE_FORCE
-  LC_TERMINAL="" TERM_PROGRAM="Apple_Terminal" "$TAB_STATE" green
+  LC_TERMINAL="" TERM_PROGRAM="Apple_Terminal" "$TAB_STATE" start
   check "$CURRENT" "" "$(out)"
 fi
 
 if it "recognizes iTerm2 from LC_TERMINAL"; then
   unset TAB_STATE_FORCE
-  LC_TERMINAL="iTerm2" TERM_PROGRAM="" "$TAB_STATE" green
+  LC_TERMINAL="iTerm2" TERM_PROGRAM="" "$TAB_STATE" start
   check "$CURRENT" "$GREEN" "$(out)"
 fi
 
 if it "stays silent under tmux"; then
-  TMUX="/tmp/tmux-0/default,1,0" "$TAB_STATE" green
+  TMUX="/tmp/tmux-0/default,1,0" "$TAB_STATE" start
   check "$CURRENT" "" "$(out)"
 fi
 
 if it "stays silent under screen"; then
-  STY="1234.pts-0.host" "$TAB_STATE" green
+  STY="1234.pts-0.host" "$TAB_STATE" start
   check "$CURRENT" "" "$(out)"
+fi
+
+# A fake process table for the tty walk, so it can be exercised without a real
+# terminal. Unknown pids (the hook's real parent) map to the first row.
+fake_ps() { # "pid ppid tty comm"... -> a PATH with that `ps` in front
+  local bin="$SANDBOX/psbin"
+  mkdir -p "$bin"
+  printf '%s\n' "$@" >"$SANDBOX/ps-table"
+  cat >"$bin/ps" <<EOF
+#!/bin/bash
+echo "\$*" >>"$SANDBOX/ps-calls"
+pid=\${!#}
+row=\$(awk -v p="\$pid" '\$1 == p' "$SANDBOX/ps-table")
+[ -n "\$row" ] || row=\$(head -1 "$SANDBOX/ps-table")
+echo "\$row" | cut -d' ' -f2-
+EOF
+  chmod +x "$bin/ps"
+  printf '%s:%s' "$bin" "$PATH"
+}
+
+if it "the tty walk stops at a nested headless claude"; then
+  # A `claude -p` run from the Bash tool: no tty on it or the shell under it,
+  # and the parent session's tab further up. Walking on would let the nested
+  # SessionStart reset that tab and drop its subagents mid-turn.
+  unset TAB_STATE_DEV
+  path=$(fake_ps "0 100 ?? sh" "100 200 ?? /opt/bin/claude" "200 1 ttys099 claude")
+  PATH="$path" "$TAB_STATE" start
+  check "$CURRENT" "2" "$(wc -l <"$SANDBOX/ps-calls" | tr -d ' ')"
+fi
+
+if it "the tty walk passes through processes that are not claude"; then
+  unset TAB_STATE_DEV
+  path=$(fake_ps "0 100 ?? sh" "100 200 ?? node" "200 1 ttys099 claude")
+  PATH="$path" "$TAB_STATE" start
+  check "$CURRENT" "3" "$(wc -l <"$SANDBOX/ps-calls" | tr -d ' ')"
 fi
 
 # ---------------------------------------------------------------- tty registry
 
 if it "registers the tty it paints"; then
-  "$TAB_STATE" green
+  "$TAB_STATE" start
   check "$CURRENT (dev)" "$TAB_STATE_DEV" "$(cut -d' ' -f1 <"$REGISTRY")"
   check "$CURRENT (state)" "busy" "$(shown)"
 fi
@@ -494,7 +573,7 @@ fi
 if it "deregisters the tab when it goes back to default"; then
   # The registry is the set of painted tabs; an unpainted one has nothing for
   # another tab's sweep — or toggle.sh — to clear.
-  "$TAB_STATE" green
+  "$TAB_STATE" start
   check "$CURRENT (painted)" "present" "$(exists "$REGISTRY")"
   "$TAB_STATE" reset
   check "$CURRENT (cleared)" "absent" "$(exists "$REGISTRY")"
@@ -551,12 +630,27 @@ fi
 if it "a quiet tab is spared while it waits on the user or a subagent"; then
   # Both are legitimately long-lived: an unanswered permission prompt and a
   # subagent that reports nothing for an hour. Only `busy` ages out.
+  mkdir -p "$STATE_DIR"
+  : >"$STATE_DIR/agent-other-ag_one" # blue is exempt only while a token backs it
   for held in hold agents; do
     other=$(strand $$ "$held")
     age "$STATE_DIR/tty-other" 3600
     "$TAB_STATE" reset
     check "$CURRENT ($held)" "" "$(cat "$other")"
   done
+fi
+
+if it "a blue tab with no subagent left is cleared"; then
+  # Blue is only exempt while a token backs it; once the last one is gone or
+  # aged out, the tab ages out like a busy one. The live case: a token from
+  # 10:22 whose SubagentStop never came held a tab blue for six hours.
+  other=$(strand $$ agents)
+  age "$STATE_DIR/tty-other" 3600
+  : >"$STATE_DIR/agent-other-ag_stuck"
+  age "$STATE_DIR/agent-other-ag_stuck" 100000
+  "$TAB_STATE" reset
+  check "$CURRENT (cleared)" "$DEFAULT" "$(cat "$other")"
+  check "$CURRENT (token swept)" "absent" "$(exists "$STATE_DIR/agent-other-ag_stuck")"
 fi
 
 if it "an unrecognized state ages out instead of being spared forever"; then
@@ -579,10 +673,10 @@ fi
 
 if it "clearing a stranded tab drops its leftover state"; then
   other=$(strand "$(dead_pid)" busy)
-  : >"$STATE_DIR/stopped-other"
+  : >"$STATE_DIR/open-other"
   : >"$STATE_DIR/agent-other-ag_one"
   "$TAB_STATE" reset
-  check "$CURRENT (marker)" "absent" "$(exists "$STATE_DIR/stopped-other")"
+  check "$CURRENT (marker)" "absent" "$(exists "$STATE_DIR/open-other")"
   check "$CURRENT (agent token)" "absent" "$(exists "$STATE_DIR/agent-other-ag_one")"
 fi
 
@@ -600,7 +694,7 @@ if it "a stranded yellow tab is cleared once its session is gone"; then
 fi
 
 if it "the hot path leaves sweeping to the turn end"; then
-  # The sweep costs a fork; PreToolUse and PostToolUse run constantly.
+  # The sweep costs a fork; PostToolUse runs constantly.
   other=$(strand "$(dead_pid)" busy)
   "$TAB_STATE" start
   "$TAB_STATE" green
@@ -632,7 +726,7 @@ if it "toggle flips both directions"; then
 fi
 
 if it "toggle off clears registered tabs"; then
-  "$TAB_STATE" green
+  "$TAB_STATE" start
   clear_out
   "$TOGGLE" off >/dev/null 2>&1
   check "$CURRENT" "$DEFAULT" "$(out)"
@@ -646,12 +740,22 @@ if it "toggle off clears a tab another session registered"; then
   check "$CURRENT" "$DEFAULT" "$(cat "$other")"
 fi
 
-if it "toggle off prunes dead ttys from the registry"; then
-  "$TAB_STATE" green
+if it "toggle off drains the registry"; then
+  "$TAB_STATE" start
   record "$SANDBOX/gone" $$ busy
   "$TOGGLE" off >/dev/null 2>&1
   check "$CURRENT (dead dropped)" "absent" "$(exists "$STATE_DIR/tty-gone")"
-  check "$CURRENT (live kept)" "present" "$(exists "$REGISTRY")"
+  check "$CURRENT (live dropped)" "absent" "$(exists "$REGISTRY")"
+  check "$CURRENT (turn closed)" "absent" "$(exists "$MARKER")"
+fi
+
+if it "toggle off drains from a terminal that is not iTerm2"; then
+  # The terminal guards are about the terminal running the hook; the tabs being
+  # cleared were painted from iTerm2 regardless of where you run toggle.sh.
+  other=$(strand $$ busy)
+  TAB_STATE_FORCE="" LC_TERMINAL="" TERM_PROGRAM="Apple_Terminal" TMUX=x \
+    "$TOGGLE" off >/dev/null 2>&1
+  check "$CURRENT" "$DEFAULT" "$(cat "$other")"
 fi
 
 if it "toggle rejects an unknown subcommand"; then
@@ -733,6 +837,26 @@ PY
   "$INSTALL" >/dev/null 2>&1
   check "$CURRENT" "1" \
     "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["hooks"].get("PreCompact",[])))' "$SETTINGS")"
+fi
+
+if it "install unwires PreToolUse left by an older install"; then
+  # It fires before the permission prompt, so it never shortened the yellow it
+  # was added for. A re-install must take it out, and only our entry.
+  seed_settings
+  python3 - "$SETTINGS" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["hooks"]["PreToolUse"].append({"hooks": [
+    {"type": "command", "command": "bash ~/.claude/tab-state.sh green"}]})
+json.dump(d, open(p, "w"))
+PY
+  "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT (ours gone)" "0" \
+    "$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print(sum("tab-state" in h["command"] for g in d["hooks"]["PreToolUse"] for h in g["hooks"]))' "$SETTINGS")"
+  check "$CURRENT (foreign kept)" "1" "$(count_hooks unrelated-tool)"
 fi
 
 if it "install does not claim a wrapper that merely mentions the path"; then
@@ -825,7 +949,27 @@ if it "install skips the subagent events on Claude Code older than 2.0.43"; then
   seed_settings
   PATH="$(fake_claude 2.0.42)" "$INSTALL" >/dev/null 2>&1
   check "$CURRENT (skipped)" "0" "$(count_hooks agent-start)"
-  check "$CURRENT (rest wired)" "8" "$(count_hooks tab-state.sh)"
+  check "$CURRENT (rest wired)" "7" "$(count_hooks tab-state.sh)"
+fi
+
+# An API error ends the turn with StopFailure and no Stop, so without it a rate
+# limit leaves the tab green.
+has_event() { # event -> yes|no
+  python3 -c 'import json,sys
+print("yes" if sys.argv[2] in json.load(open(sys.argv[1])).get("hooks",{}) else "no")' "$SETTINGS" "$1"
+}
+
+if it "install wires StopFailure to reset from 2.1.78"; then
+  seed_settings
+  PATH="$(fake_claude 2.1.78)" "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT (2.1.78)" "reset" \
+    "$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print(d["hooks"]["StopFailure"][0]["hooks"][0]["command"].rsplit(" ",1)[1])' "$SETTINGS")"
+  seed_settings
+  PATH="$(fake_claude 2.1.77)" "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT (2.1.77 skipped)" "no" "$(has_event StopFailure)"
+  check "$CURRENT (2.1.77 subagents kept)" "yes" "$(has_event SubagentStart)"
 fi
 
 if it "install wires the subagent events on 2.0.43 and newer"; then

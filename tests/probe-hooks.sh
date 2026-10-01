@@ -9,8 +9,12 @@
 # session, so it needs the `claude` binary and spends API tokens. Run it by
 # hand when upgrading Claude Code.
 #
-# Everything happens in a temp dir with its own --settings file. Your real
-# ~/.claude is never read or written.
+# Everything happens in a temp dir with its own --settings file. That file is
+# loaded *on top of* your ~/.claude settings, not instead of them, so your own
+# hooks — tab-state.sh included — fire in the probe session too. Your user
+# settings stay loaded on purpose: their `env` may carry the API setup the
+# session needs. Run from a terminal, the probe may recolor that tab; run from
+# inside Claude Code, the nested session has no tty and tab-state.sh stays out.
 #
 # What it checks, in order of how quietly each would break us:
 #   1. SubagentStart / SubagentStop both fire.
@@ -65,7 +69,7 @@ chmod +x "$SANDBOX/probe.sh"
 python3 - "$SANDBOX/probe.sh" >"$SANDBOX/settings.json" <<'PY'
 import json, sys
 probe = sys.argv[1]
-events = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
+events = ["SessionStart", "UserPromptSubmit", "PostToolUse",
           "SubagentStart", "SubagentStop", "Stop", "SessionEnd"]
 hooks = {e: [{"hooks": [{"type": "command",
                          "command": "bash %s %s" % (probe, e)}]}] for e in events}
@@ -131,8 +135,8 @@ check(bool(sid) and sid == pid, "the two agent_ids agree",
 
 print()
 print("other events driving the colors")
-for event in ("SessionStart", "UserPromptSubmit", "PreToolUse",
-              "PostToolUse", "Stop", "SessionEnd"):
+for event in ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop",
+              "SessionEnd"):
     check(event in seen, "%s fires" % event)
 
 # The point of this stage: our own parser, against the payload as shipped today
