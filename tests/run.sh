@@ -740,12 +740,22 @@ if it "toggle off clears a tab another session registered"; then
   check "$CURRENT" "$DEFAULT" "$(cat "$other")"
 fi
 
-if it "toggle off prunes dead ttys from the registry"; then
+if it "toggle off drains the registry"; then
   "$TAB_STATE" start
   record "$SANDBOX/gone" $$ busy
   "$TOGGLE" off >/dev/null 2>&1
   check "$CURRENT (dead dropped)" "absent" "$(exists "$STATE_DIR/tty-gone")"
-  check "$CURRENT (live kept)" "present" "$(exists "$REGISTRY")"
+  check "$CURRENT (live dropped)" "absent" "$(exists "$REGISTRY")"
+  check "$CURRENT (turn closed)" "absent" "$(exists "$MARKER")"
+fi
+
+if it "toggle off drains from a terminal that is not iTerm2"; then
+  # The terminal guards are about the terminal running the hook; the tabs being
+  # cleared were painted from iTerm2 regardless of where you run toggle.sh.
+  other=$(strand $$ busy)
+  TAB_STATE_FORCE="" LC_TERMINAL="" TERM_PROGRAM="Apple_Terminal" TMUX=x \
+    "$TOGGLE" off >/dev/null 2>&1
+  check "$CURRENT" "$DEFAULT" "$(cat "$other")"
 fi
 
 if it "toggle rejects an unknown subcommand"; then

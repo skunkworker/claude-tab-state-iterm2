@@ -37,6 +37,10 @@ version, so the date something landed is the useful thing to know.
   tool call would not leave the tab yellow for the whole run. But it fires
   before the permission prompt, and no hook fires on approval, so it never did
   that — it only doubled the per-tool cost. Re-running `install.sh` unwires it.
+- `toggle.sh off` drains through `tab-state.sh` rather than its own copy of
+  the loop, which had already drifted (it kept live records). The disabled
+  check moved above the iTerm2 and tmux guards to make that work from any
+  terminal: those guard the terminal running the hook, not the tabs drained.
 - Subagent tokens are empty files aged by mtime, so `agent-start` no longer
   forks `date`, and the agent events no longer sweep at all.
 

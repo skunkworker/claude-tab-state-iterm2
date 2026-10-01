@@ -256,25 +256,19 @@ case "${1:-}" in
     ;;
 esac
 
-# Unsupported terminals render OSC 6 as literal garbage in the scrollback, so
-# stay silent unless we know we are talking to iTerm2.
-if [ "${TAB_STATE_FORCE:-}" != 1 ] &&
-  [ "${LC_TERMINAL:-}" != "iTerm2" ] && [ "${TERM_PROGRAM:-}" != "iTerm.app" ]; then
-  exit 0
-fi
-
-# Under tmux/screen the escape reaches the multiplexer, not the tab. Passthrough
-# wrapping was tried and removed: every pane shares one iTerm2 tab, so the
-# signal cannot mean what it means everywhere else.
-[ -n "${TMUX:-}${STY:-}" ] && exit 0
-
 # Feature off: clear anything we painted and get out. Deliberately above
 # resolve_dev, which is the most expensive thing this script does and is pure
 # waste for a disabled feature. Fork-free once the state has been drained.
 #
+# Above the terminal guards too: those are about the terminal running this
+# hook, while the drain only writes to tabs iTerm2 already showed our color in.
+# That is also what lets toggle.sh drain through here from any terminal rather
+# than keep a second copy of this loop.
+#
 # Subagent tokens go too. This arm swallows the SubagentStop that would have
 # removed them, so leaving them behind means re-enabling paints blue for an
-# agent that finished while the feature was off.
+# agent that finished while the feature was off. Open-turn markers go so that
+# every turn is closed on re-enable — the safe side.
 if [ -e "$DISABLE_FLAG" ]; then
   for f in "$STATE_DIR"/tty-*; do
     [ -e "$f" ] || continue
@@ -290,6 +284,18 @@ if [ -e "$DISABLE_FLAG" ]; then
   done
   exit 0
 fi
+
+# Unsupported terminals render OSC 6 as literal garbage in the scrollback, so
+# stay silent unless we know we are talking to iTerm2.
+if [ "${TAB_STATE_FORCE:-}" != 1 ] &&
+  [ "${LC_TERMINAL:-}" != "iTerm2" ] && [ "${TERM_PROGRAM:-}" != "iTerm.app" ]; then
+  exit 0
+fi
+
+# Under tmux/screen the escape reaches the multiplexer, not the tab. Passthrough
+# wrapping was tried and removed: every pane shares one iTerm2 tab, so the
+# signal cannot mean what it means everywhere else.
+[ -n "${TMUX:-}${STY:-}" ] && exit 0
 
 owner=$PPID              # stands in when TAB_STATE_DEV skips the walk
 dev="${TAB_STATE_DEV:-}" # doubles as the initializer resolve_dev may not set
