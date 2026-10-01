@@ -39,7 +39,7 @@ setup() {
   : >"$TAB_STATE_DEV"
   STATE_DIR="$HOME/.claude/.tab-state"
   REGISTRY="$STATE_DIR/tty-out"
-  MARKER="$STATE_DIR/stopped-out"
+  MARKER="$STATE_DIR/open-out"
   DISABLED="$HOME/.claude/tab-state.disabled"
   SETTINGS="$HOME/.claude/settings.json"
 }
@@ -123,13 +123,19 @@ paints() { # state expected
   "$TAB_STATE" "$1"
   check "$CURRENT" "$2" "$(out)"
 }
-paints green "$GREEN"
 paints start "$GREEN"
 paints reset "$DEFAULT"
 
+if it "green paints the tab once a turn is open"; then
+  "$TAB_STATE" start
+  clear_out
+  "$TAB_STATE" green
+  check "$CURRENT" "$GREEN" "$(out)"
+fi
+
 if it "paints without writing to stderr"; then
-  # A missing stop marker is the normal case, so the redirect that reads it
-  # must not leak "No such file or directory" into the hook's stderr.
+  # A missing marker or record is the normal case, so nothing that tests or
+  # reads one may leak "No such file or directory" into the hook's stderr.
   check "$CURRENT (green)" "" "$("$TAB_STATE" green 2>&1 >/dev/null)"
   check "$CURRENT (start)" "" "$("$TAB_STATE" start 2>&1 >/dev/null)"
   check "$CURRENT (reset)" "" "$("$TAB_STATE" reset 2>&1 >/dev/null)"
@@ -185,11 +191,29 @@ if it "the latch never expires"; then
   # the session title — and its tool hooks arrive minutes later with no `start`
   # before them and no `Stop` behind them. Any expiry lets one of those repaint
   # a finished tab green for good, which is exactly what was seen in the wild.
+  # A closed turn is the absence of a file, so there is no clock to run out.
+  "$TAB_STATE" start
   "$TAB_STATE" reset
+  check "$CURRENT (no marker)" "absent" "$(exists "$MARKER")"
   clear_out
-  age "$MARKER" 3600
   "$TAB_STATE" green
   check "$CURRENT" "" "$(out)"
+fi
+
+if it "lost state counts as a closed turn"; then
+  # The marker records "open", so a state dir that was drained, toggled or
+  # never written lands on the safe side: dark until the next prompt, never
+  # green for good.
+  "$TAB_STATE" green
+  check "$CURRENT (fresh)" "" "$(out)"
+  "$TAB_STATE" start
+  "$TAB_STATE" reset
+  "$TOGGLE" off >/dev/null 2>&1
+  "$TOGGLE" on >/dev/null 2>&1
+  clear_out
+  "$TAB_STATE" green # a post-turn tool hook after re-enabling
+  check "$CURRENT (after toggle)" "" "$(out)"
+  check "$CURRENT (unregistered)" "absent" "$(exists "$REGISTRY")"
 fi
 
 if it "start reopens the turn so the next green paints"; then
@@ -206,12 +230,13 @@ if it "a Stop landing mid-paint does not strand the tab green"; then
   # blocks on open until something reads, so the Stop can land mid-brushstroke.
   mkfifo "$SANDBOX/fifo"
   mkdir -p "$STATE_DIR"
+  : >"$STATE_DIR/open-fifo" # the turn is open
   TAB_STATE_DEV="$SANDBOX/fifo" "$TAB_STATE" green &
   painter=$!
   # The record is written immediately before the paint blocks opening the fifo,
   # so it is a precise "past the latch test" signal — better than a fixed sleep.
   while [ ! -e "$STATE_DIR/tty-fifo" ]; do sleep 0.05; done
-  : >"$STATE_DIR/stopped-fifo"
+  rm -f "$STATE_DIR/open-fifo" # the Stop
   # One reader per emit: each opens and closes the fifo, so a single cat would
   # take the first EOF and leave the second write with nowhere to go.
   (
@@ -232,7 +257,7 @@ if it "a green after the turn closed clears a tab left painted"; then
   # It is the last event that tab will ever see, so it heals instead of painting.
   "$TAB_STATE" start
   "$TAB_STATE" green
-  : >"$MARKER" # a Stop whose reset never reached the tab
+  rm -f "$MARKER" # a Stop whose reset never reached the tab
   clear_out
   "$TAB_STATE" green
   check "$CURRENT (cleared)" "$DEFAULT" "$(out)"
@@ -246,7 +271,7 @@ if it "a green after the turn closed heals a state it does not recognize"; then
   "$TAB_STATE" start
   "$TAB_STATE" green
   record "$TAB_STATE_DEV" $$ future-state
-  : >"$MARKER"
+  rm -f "$MARKER"
   clear_out
   "$TAB_STATE" green
   check "$CURRENT" "$DEFAULT" "$(out)"
@@ -256,7 +281,7 @@ if it "a green after the turn closed spares a tab still waiting on you"; then
   # `hold` outlives the turn: an unanswered permission prompt is still true.
   "$TAB_STATE" start
   "$TAB_STATE" yellow
-  : >"$MARKER"
+  rm -f "$MARKER"
   clear_out
   "$TAB_STATE" green
   check "$CURRENT (untouched)" "" "$(out)"
@@ -407,7 +432,7 @@ fi
 # --------------------------------------------------------------- disable flag
 
 if it "the disable flag clears painted tabs and drains the registry"; then
-  "$TAB_STATE" green
+  "$TAB_STATE" start
   : >"$DISABLED"
   clear_out
   "$TAB_STATE" green
@@ -443,13 +468,13 @@ if it "toggle off forgets outstanding subagents"; then
 fi
 
 if it "session reaps records for ttys that are gone"; then
-  "$TAB_STATE" green
+  "$TAB_STATE" start
   # A live owner, but a tty that is gone — which outranks it.
   record "$SANDBOX/vanished" $$ busy
-  : >"$STATE_DIR/stopped-vanished"
+  : >"$STATE_DIR/open-vanished"
   "$TAB_STATE" session </dev/null
   check "$CURRENT (dead tty gone)" "absent" "$(exists "$STATE_DIR/tty-vanished")"
-  check "$CURRENT (its marker gone)" "absent" "$(exists "$STATE_DIR/stopped-vanished")"
+  check "$CURRENT (its marker gone)" "absent" "$(exists "$STATE_DIR/open-vanished")"
 fi
 
 if it "the disable flag stays silent once nothing is painted"; then
@@ -462,30 +487,30 @@ fi
 
 if it "stays silent outside iTerm2"; then
   unset TAB_STATE_FORCE
-  LC_TERMINAL="" TERM_PROGRAM="Apple_Terminal" "$TAB_STATE" green
+  LC_TERMINAL="" TERM_PROGRAM="Apple_Terminal" "$TAB_STATE" start
   check "$CURRENT" "" "$(out)"
 fi
 
 if it "recognizes iTerm2 from LC_TERMINAL"; then
   unset TAB_STATE_FORCE
-  LC_TERMINAL="iTerm2" TERM_PROGRAM="" "$TAB_STATE" green
+  LC_TERMINAL="iTerm2" TERM_PROGRAM="" "$TAB_STATE" start
   check "$CURRENT" "$GREEN" "$(out)"
 fi
 
 if it "stays silent under tmux"; then
-  TMUX="/tmp/tmux-0/default,1,0" "$TAB_STATE" green
+  TMUX="/tmp/tmux-0/default,1,0" "$TAB_STATE" start
   check "$CURRENT" "" "$(out)"
 fi
 
 if it "stays silent under screen"; then
-  STY="1234.pts-0.host" "$TAB_STATE" green
+  STY="1234.pts-0.host" "$TAB_STATE" start
   check "$CURRENT" "" "$(out)"
 fi
 
 # ---------------------------------------------------------------- tty registry
 
 if it "registers the tty it paints"; then
-  "$TAB_STATE" green
+  "$TAB_STATE" start
   check "$CURRENT (dev)" "$TAB_STATE_DEV" "$(cut -d' ' -f1 <"$REGISTRY")"
   check "$CURRENT (state)" "busy" "$(shown)"
 fi
@@ -513,7 +538,7 @@ fi
 if it "deregisters the tab when it goes back to default"; then
   # The registry is the set of painted tabs; an unpainted one has nothing for
   # another tab's sweep — or toggle.sh — to clear.
-  "$TAB_STATE" green
+  "$TAB_STATE" start
   check "$CURRENT (painted)" "present" "$(exists "$REGISTRY")"
   "$TAB_STATE" reset
   check "$CURRENT (cleared)" "absent" "$(exists "$REGISTRY")"
@@ -613,10 +638,10 @@ fi
 
 if it "clearing a stranded tab drops its leftover state"; then
   other=$(strand "$(dead_pid)" busy)
-  : >"$STATE_DIR/stopped-other"
+  : >"$STATE_DIR/open-other"
   : >"$STATE_DIR/agent-other-ag_one"
   "$TAB_STATE" reset
-  check "$CURRENT (marker)" "absent" "$(exists "$STATE_DIR/stopped-other")"
+  check "$CURRENT (marker)" "absent" "$(exists "$STATE_DIR/open-other")"
   check "$CURRENT (agent token)" "absent" "$(exists "$STATE_DIR/agent-other-ag_one")"
 fi
 
@@ -666,7 +691,7 @@ if it "toggle flips both directions"; then
 fi
 
 if it "toggle off clears registered tabs"; then
-  "$TAB_STATE" green
+  "$TAB_STATE" start
   clear_out
   "$TOGGLE" off >/dev/null 2>&1
   check "$CURRENT" "$DEFAULT" "$(out)"
@@ -681,7 +706,7 @@ if it "toggle off clears a tab another session registered"; then
 fi
 
 if it "toggle off prunes dead ttys from the registry"; then
-  "$TAB_STATE" green
+  "$TAB_STATE" start
   record "$SANDBOX/gone" $$ busy
   "$TOGGLE" off >/dev/null 2>&1
   check "$CURRENT (dead dropped)" "absent" "$(exists "$STATE_DIR/tty-gone")"

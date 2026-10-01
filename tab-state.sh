@@ -105,15 +105,20 @@ unregister_tty() { rm -f "$TTY_RECORD" 2>/dev/null; }
 forget_tty() { # tty
   [ -w "$1" ] && printf '%b' "$RESET_SEQ" >"$1" 2>/dev/null
   local key=${1##*/}
-  rm -f "${STATE_DIR}/tty-$key" "${STATE_DIR}/stopped-$key" "${STATE_DIR}/agent-$key-"* 2>/dev/null
+  rm -f "${STATE_DIR}/tty-$key" "${STATE_DIR}/open-$key" "${STATE_DIR}/agent-$key-"* 2>/dev/null
 }
 
-# True while the turn is closed. `reset` closes it, `start` reopens it — a
-# latch, because nothing in the payload can order a PostToolUse green against
-# the Stop that races it. No expiry: Claude Code's own post-turn model work
-# (away summaries, titling) fires tool hooks minutes later with no `Stop`
-# behind them, so any window lets one repaint a finished tab green for good.
-turn_is_closed() { [ -e "$STOP_MARKER" ]; }
+# True while the turn is closed. `start` opens it, `reset` closes it — a latch,
+# because nothing in the payload can order a PostToolUse green against the Stop
+# that races it. No expiry: Claude Code's own post-turn model work (away
+# summaries, titling) fires tool hooks minutes later with no `Stop` behind
+# them, so any window lets one repaint a finished tab green for good.
+#
+# The marker records "open", not "closed", so that lost state — a drained state
+# dir, a toggle, an upgrade — lands on the safe side. A closed turn that should
+# have been open costs a dark tab until the next prompt; the reverse is a tab
+# green for good. It also exists only during a turn, so nothing accumulates.
+turn_is_closed() { [ ! -e "$OPEN_MARKER" ]; }
 
 # One token file per outstanding subagent, keyed by the agent_id that both
 # SubagentStart and SubagentStop carry. Counting in a shared file would be a
@@ -270,9 +275,9 @@ if [ -e "$DISABLE_FLAG" ]; then
   done
   # The loop is a fork-free probe for leftovers no registry entry named; one
   # `rm` then drains both classes, rather than one per file.
-  for f in "$STATE_DIR"/agent-* "$STATE_DIR"/stopped-*; do
+  for f in "$STATE_DIR"/agent-* "$STATE_DIR"/open-*; do
     [ -e "$f" ] || continue
-    rm -f "$STATE_DIR"/agent-* "$STATE_DIR"/stopped-* 2>/dev/null
+    rm -f "$STATE_DIR"/agent-* "$STATE_DIR"/open-* 2>/dev/null
     break
   done
   exit 0
@@ -286,7 +291,7 @@ dev="${TAB_STATE_DEV:-}" # doubles as the initializer resolve_dev may not set
 # Every record this tab owns is keyed by its tty name, derived once here.
 key=${dev##*/}
 TTY_RECORD="${STATE_DIR}/tty-$key"
-STOP_MARKER="${STATE_DIR}/stopped-$key"
+OPEN_MARKER="${STATE_DIR}/open-$key"
 AGENT_GLOB="${STATE_DIR}/agent-$key-"
 [ -d "$STATE_DIR" ] || mkdir -p "$STATE_DIR" 2>/dev/null
 
@@ -294,8 +299,9 @@ AGENT_GLOB="${STATE_DIR}/agent-$key-"
 
 case "$state" in
   start)
-    # UserPromptSubmit: the turn is open by definition, so reopen the latch.
-    rm -f "$STOP_MARKER" 2>/dev/null
+    # UserPromptSubmit: the turn is open by definition. A flag, not a clock:
+    # nothing reads its contents, so a bare redirect rather than a `date` fork.
+    : >"$OPEN_MARKER" 2>/dev/null
     paint_busy
     ;;
   green)
@@ -317,9 +323,7 @@ case "$state" in
     paint hold 235 190 0
     ;;
   reset)
-    # The marker is a flag, not a clock: nothing reads its contents, so it is
-    # written with a bare redirect rather than a `date` fork.
-    : >"$STOP_MARKER" 2>/dev/null
+    rm -f "$OPEN_MARKER" 2>/dev/null
     # Once a turn, off the hot path: the only chance a stranded tab in another
     # terminal has of being cleaned up. First, so the stale-token sweep inside
     # it also decides our own color below.
@@ -341,8 +345,7 @@ case "$state" in
     json_field source
     if [ "$FIELD" != compact ]; then
       # Any other boundary is the one point where nothing can still be running.
-      rm -f "$AGENT_GLOB"* 2>/dev/null
-      : >"$STOP_MARKER" 2>/dev/null
+      rm -f "$AGENT_GLOB"* "$OPEN_MARKER" 2>/dev/null
       reset_color
     fi
     heal_registry

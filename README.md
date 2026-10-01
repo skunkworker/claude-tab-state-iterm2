@@ -120,17 +120,21 @@ almost nothing per tool call.
   only on agent events, so a tab that never saw another one stayed blue for
   good; that was caught live, six hours after the lost `SubagentStop`.
 
-- **Not getting stuck.** `Stop` does not fire when the turn ends on an API
-  error — Claude Code sends `StopFailure` instead, so both reset. Nor does it
-  fire when you quit, which used to leave the tab green with nothing behind
-  it — hence `SessionEnd`; a crash sends nothing and is left to the sweep
-  below. An interrupt (Esc) sends neither `Stop` nor `SessionEnd`, so that tab
-  stays green until your next prompt, the idle nudge, or the sweep. And with parallel tool calls a slow `PostToolUse` green can
-  land *after* `Stop`'s reset. Nothing in the payload can order those two, so
-  `reset` closes the turn and `start` reopens it: green does not paint in
-  between. The latch is still a check followed by a paint, so `green` re-reads
-  it afterwards — a `Stop` that slips between the two would otherwise be
-  painted over by a green nobody is coming back to undo.
+- **Not getting stuck.** `Stop` does not fire when the turn ends on an API error
+  — Claude Code sends `StopFailure` instead, so both reset. Nor does it fire
+  when you quit, which used to leave the tab green with nothing behind it —
+  hence `SessionEnd`; a crash sends nothing and is left to the sweep below. An
+  interrupt (Esc) sends neither `Stop` nor `SessionEnd`, so that tab stays green
+  until your next prompt, the idle nudge, or the sweep. And with parallel tool
+  calls a slow `PostToolUse` green can land *after* `Stop`'s reset. Nothing in
+  the payload can order those two, so `reset` closes the turn and `start`
+  reopens it: green does not paint in between. The latch file marks the turn
+  *open*, so lost state — a toggle, a drained state dir — reads as closed: dark
+  until your next prompt, never green for good. An earlier version marked it
+  closed, and toggling the feature off and on reopened every tab's latch. The
+  latch is still a check followed by a paint, so `green` re-reads it afterwards
+  — a `Stop` that slips between the two would otherwise be painted over by a
+  green nobody is coming back to undo.
 
 - **Why the latch has no expiry.** It used to lapse after 60s, so that a
   session resumed without a `start` healed rather than staying dark. That

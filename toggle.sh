@@ -43,7 +43,9 @@ disable() {
   reset_registered_ttys
   # Subagent tokens too: while off, tab-state.sh never sees the SubagentStop
   # that would clear them, so they would strand the tab blue on re-enable.
-  for f in "$STATE_DIR"/agent-* "$STATE_DIR"/stopped-*; do
+  # Open-turn markers too, so every turn is closed on re-enable: a missing one
+  # means "closed", which is the safe side.
+  for f in "$STATE_DIR"/agent-* "$STATE_DIR"/open-*; do
     [ -e "$f" ] && rm -f "$f"
   done
   # The current terminal may not be registered yet (no hook has fired in it).

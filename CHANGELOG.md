@@ -17,6 +17,13 @@ version, so the date something landed is the useful thing to know.
   another one. And the foreign sweep spared blue tabs by name, with no bound.
   Now every turn end, in any tab, drops aged tokens with one `find`, and blue
   is exempt only while a token still backs it.
+- **Toggling off and on reopened every turn.** The latch marked a turn
+  *closed*, and the toggle drained those markers, so after `toggle.sh on` the
+  next post-turn tool hook (an away summary) painted the tab green for good.
+  The latch now marks the turn *open* (`open-<tty>`, written by `start`), so
+  lost state reads as closed. It exists only during a turn, which also ends the
+  `stopped-*` files that used to pile up forever — delete old ones with
+  `rm ~/.claude/.tab-state/stopped-*`.
 
 ### Changed
 
