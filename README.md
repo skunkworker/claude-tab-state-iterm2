@@ -115,7 +115,10 @@ almost nothing per tool call.
   race between the hooks of agents starting and finishing at the same moment.
   Tokens are keyed by tty as well, so a second session in another tab cannot
   color yours. If a `SubagentStop` never arrives, session boundaries drain the
-  set and a staleness sweep is the backstop.
+  set, and every turn end — in any tab — drops tokens older than the TTL. The
+  token is an empty file whose mtime is its start time. The sweep used to run
+  only on agent events, so a tab that never saw another one stayed blue for
+  good; that was caught live, six hours after the lost `SubagentStop`.
 
 - **Not getting stuck.** `Stop` does not fire when the turn ends on an API
   error — Claude Code sends `StopFailure` instead, so both reset. Nor does it
@@ -160,9 +163,10 @@ almost nothing per tool call.
   that is the guarantee — the next `claude` you start in any tab heals the
   others. Turn ends sweep as well, which only shortens the wait. An owner still
   alive keeps its tab unless its record has been `busy` and untouched for 30
-  minutes, since every tool call rewrites it — waiting on you (yellow) or on a
-  subagent (blue) is exempt *by name*, both being legitimately long-lived, so a
-  state added later ages out rather than silently becoming un-healable.
+  minutes, since every tool call rewrites it — waiting on you (yellow) is
+  exempt *by name*, and so is blue while a subagent token still backs it, both
+  being legitimately long-lived. A state added later ages out rather than
+  silently becoming un-healable.
   Clearing a tab that turns out to still be working costs nothing: its next
   tool call repaints it.
 
@@ -180,14 +184,14 @@ almost nothing per tool call.
   removed: every pane shares one iTerm2 tab, so the signal cannot mean what it
   means everywhere else.
 - **No dependencies beyond bash.** `install.sh` needs `python3` to edit
-  `settings.json`; `tab-state.sh` itself shells out only to `ps` and `date`.
+  `settings.json`; `tab-state.sh` itself shells out only to `ps` and `find`.
 
 ## Customizing
 
 - **Colors:** edit the `set_color R G B` values in `tab-state.sh` (0–255).
 - **Subagent staleness:** `TAB_STATE_AGENT_TTL_SEC` (default 7200, i.e. 2h) is
-  how long a subagent whose `SubagentStop` never arrived is believed. Raise it
-  if you run longer agents than that.
+  how long a subagent whose `SubagentStop` never arrived is believed, rounded
+  up to whole minutes. Raise it if you run longer agents than that.
 - **Abandoned-tab timeout:** `TAB_STATE_BUSY_TTL_MIN` (default 30 minutes) is
   how long a green tab may go without a hook event before another tab's turn
   end clears it. Raise it if you routinely run single tool calls longer than

@@ -36,10 +36,11 @@ RESET_SEQ='\033]6;1;bg;*;default\007'
 DISABLE_FLAG="${HOME:-}/.claude/tab-state.disabled"
 STATE_DIR="${HOME:-}/.claude/.tab-state"
 
-# Backstop for a subagent whose SubagentStop never arrives (it errored, or the
-# session died). Generous: a long research subagent must not be swept while it
-# is still working. Session boundaries drain the whole set anyway.
-AGENT_STALE_AFTER="${TAB_STATE_AGENT_TTL_SEC:-7200}"
+# Backstop for a subagent whose SubagentStop never arrives (it errored, was
+# interrupted, or the session died). Generous: a long research subagent must not
+# be swept while it is still working. Session boundaries drain the whole set
+# anyway. Seconds for compatibility; `find -mmin` wants minutes, rounded up.
+AGENT_TTL_MIN=$(((${TAB_STATE_AGENT_TTL_SEC:-7200} + 59) / 60))
 
 # How long a tab may stay painted busy with nothing refreshing its registry
 # record before another tab's turn end clears it. Every tool call rewrites the
@@ -114,38 +115,47 @@ forget_tty() { # tty
 # behind them, so any window lets one repaint a finished tab green for good.
 turn_is_closed() { [ -e "$STOP_MARKER" ]; }
 
-# States that legitimately outlive the turn that painted them: a subagent and an
-# unanswered permission prompt are both long-lived. One predicate for both the
-# foreign sweep and our own tab, so the two cannot drift apart. Testing by name
-# rather than sweeping by name is deliberate — a state added later ages out like
-# `busy` instead of silently becoming un-healable.
-outlives_turn() { [ "$1" = agents ] || [ "$1" = hold ]; }
-
 # One token file per outstanding subagent, keyed by the agent_id that both
 # SubagentStart and SubagentStop carry. Counting in a shared file would be a
 # read-modify-write race between the hook processes of agents that start and
-# finish concurrently; a glob has no such problem and needs no locking.
-agents_running() { # fork-free: the hot path only asks "any?"
+# finish concurrently; a glob has no such problem and needs no locking. The
+# file is empty: its mtime is the start time, which is all the sweep reads.
+agents_running() { # [tty-key] — fork-free: the hot path only asks "any?"
   local f
-  for f in "$AGENT_GLOB"*; do
+  for f in "${STATE_DIR}/agent-${1:-$key}-"*; do
     [ -e "$f" ] && return 0
     break
   done
   return 1
 }
 
-# Swept only on the rare agent events, never on the hot path. The fork-free
-# "any?" first, so an empty set costs no `date`.
+# States that legitimately outlive the turn that painted them: an unanswered
+# permission prompt, and blue for as long as a subagent token backs it. One
+# predicate for both the foreign sweep and our own tab, so the two cannot drift
+# apart. Testing by name rather than sweeping by name is deliberate — a state
+# added later ages out like `busy` instead of silently becoming un-healable.
+# Blue is tied to its tokens rather than exempt outright, so a lost
+# SubagentStop ends when the token ages out instead of never.
+outlives_turn() { # state tty-key
+  case "$1" in
+    hold) return 0 ;;
+    agents) agents_running "$2" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Drop every tab's subagent tokens older than the TTL. Here rather than on the
+# agent events because a tab whose SubagentStop never came may never see another
+# agent event. The fork-free probe first, so a turn with no agents anywhere
+# costs no `find`.
 sweep_agents() {
-  local f stamped now
-  agents_running || return 0
-  now=$(date +%s 2>/dev/null) || return 0
-  for f in "$AGENT_GLOB"*; do
-    [ -e "$f" ] || continue
-    read -r stamped 2>/dev/null <"$f" || stamped=0
-    [ $((now - ${stamped:-0})) -ge "$AGENT_STALE_AFTER" ] && rm -f "$f" 2>/dev/null
+  local f
+  for f in "$STATE_DIR"/agent-*; do
+    [ -e "$f" ] || return 0
+    break
   done
-  return 0
+  find "$STATE_DIR" -maxdepth 1 -name 'agent-*' -mmin "+$AGENT_TTL_MIN" \
+    -exec rm -f {} + 2>/dev/null
 }
 
 # Clear tabs no hook will ever come back for, and drop what they left behind.
@@ -157,6 +167,7 @@ sweep_agents() {
 # nothing: its next tool call repaints and re-registers it.
 heal_registry() {
   local f d o s stale=""
+  sweep_agents
   for f in "$STATE_DIR"/tty-*; do
     [ -e "$f" ] || continue
     read -r d o s 2>/dev/null <"$f" || continue
@@ -164,7 +175,7 @@ heal_registry() {
     # A record with no owner predates this format; treat it as unowned. A tty
     # that is gone skips the question entirely — forget_tty writes nothing.
     if [ -w "$d" ] && [ -n "$o" ] && kill -0 "$o" 2>/dev/null; then
-      outlives_turn "$s" && continue
+      outlives_turn "$s" "${d##*/}" && continue
       # One fork for the whole sweep, and only once a live-owner record has
       # actually asked. `-mmin` lists the aged records, so the test itself stays
       # fork-free; the newline sentinels make an empty result non-empty, which
@@ -294,7 +305,7 @@ case "$state" in
       # registered in a state that should not have survived the turn, this is
       # the last hook that will ever visit, so it clears it instead.
       read -r _ _ shown 2>/dev/null <"$TTY_RECORD" &&
-        ! outlives_turn "$shown" && reset_color
+        ! outlives_turn "$shown" "$key" && reset_color
       exit 0
     fi
     paint_busy
@@ -309,6 +320,10 @@ case "$state" in
     # The marker is a flag, not a clock: nothing reads its contents, so it is
     # written with a bare redirect rather than a `date` fork.
     : >"$STOP_MARKER" 2>/dev/null
+    # Once a turn, off the hot path: the only chance a stranded tab in another
+    # terminal has of being cleaned up. First, so the stale-token sweep inside
+    # it also decides our own color below.
+    heal_registry
     # Subagents outlive the turn that dispatched them, so a finished turn with
     # work still outstanding stays blue rather than going dark.
     if agents_running; then
@@ -316,9 +331,6 @@ case "$state" in
     else
       reset_color
     fi
-    # Once a turn, off the hot path: the only chance a stranded tab in another
-    # terminal has of being cleaned up.
-    heal_registry
     ;;
   session)
     # A compact is not a boundary: `SessionStart` fires for it, but the turn
@@ -339,8 +351,7 @@ case "$state" in
     read_payload
     json_field agent_id
     [ -n "$FIELD" ] || exit 0
-    sweep_agents
-    date +%s >"${AGENT_GLOB}${FIELD//[^A-Za-z0-9_-]/_}" 2>/dev/null
+    : >"${AGENT_GLOB}${FIELD//[^A-Za-z0-9_-]/_}" 2>/dev/null
     paint_agents
     ;;
   agent-stop)
@@ -348,7 +359,6 @@ case "$state" in
     json_field agent_id
     [ -n "$FIELD" ] || exit 0
     rm -f "${AGENT_GLOB}${FIELD//[^A-Za-z0-9_-]/_}" 2>/dev/null
-    sweep_agents
     # Hand the tab back to whatever the turn is actually doing.
     if agents_running; then
       paint_agents

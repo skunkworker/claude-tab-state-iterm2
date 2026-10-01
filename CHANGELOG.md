@@ -11,6 +11,17 @@ version, so the date something landed is the useful thing to know.
   overload sends `StopFailure`, not `Stop`, so nothing reset the tab. It is now
   wired to `reset` on Claude Code 2.1.78 and newer. The version gate moved into
   the Python merge as a per-event table, so the next gated event is one line.
+- **A lost `SubagentStop` held a tab blue forever.** Caught live: a token from
+  10:22 still held `ttys004` blue at 16:28, its session alive. Two gaps lined
+  up. The 2h token sweep ran only on agent events, and that tab never saw
+  another one. And the foreign sweep spared blue tabs by name, with no bound.
+  Now every turn end, in any tab, drops aged tokens with one `find`, and blue
+  is exempt only while a token still backs it.
+
+### Changed
+
+- Subagent tokens are empty files aged by mtime, so `agent-start` no longer
+  forks `date`, and the agent events no longer sweep at all.
 
 ## 2026-08-12
 

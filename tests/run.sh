@@ -367,15 +367,34 @@ if it "agent events without an agent_id are ignored"; then
   check "$CURRENT (no token)" "0" "$(agent_count)"
 fi
 
-if it "stale subagent tokens are swept"; then
+if it "a stale subagent token is swept at the turn end"; then
+  # A SubagentStop that never arrived must not strand the tab blue forever —
+  # even when no further agent event ever comes to this tab, as seen in the wild.
   "$TAB_STATE" start
   agent agent-start ag_stuck
-  # A SubagentStop that never arrived must not strand the tab blue forever.
-  printf '%s\n' "$(($(date +%s) - 100000))" >"$STATE_DIR/agent-out-ag_stuck"
+  age "$STATE_DIR/agent-out-ag_stuck" 100000
   clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (default)" "$DEFAULT" "$(out)"
+  check "$CURRENT (swept)" "0" "$(agent_count)"
+fi
+
+if it "a fresh subagent token survives the turn-end sweep"; then
+  "$TAB_STATE" start
   agent agent-start ag_live
-  agent agent-stop ag_live
-  check "$CURRENT (swept)" "$GREEN" "$(out)"
+  age "$STATE_DIR/agent-out-ag_live" 600
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (still blue)" "$BLUE" "$(out)"
+  check "$CURRENT (kept)" "1" "$(agent_count)"
+fi
+
+if it "the subagent timeout is configurable"; then
+  "$TAB_STATE" start
+  agent agent-start ag_live
+  age "$STATE_DIR/agent-out-ag_live" 600
+  TAB_STATE_AGENT_TTL_SEC=300 "$TAB_STATE" reset
+  check "$CURRENT" "0" "$(agent_count)"
 fi
 
 if it "an agent_id cannot escape the state directory"; then
@@ -551,12 +570,27 @@ fi
 if it "a quiet tab is spared while it waits on the user or a subagent"; then
   # Both are legitimately long-lived: an unanswered permission prompt and a
   # subagent that reports nothing for an hour. Only `busy` ages out.
+  mkdir -p "$STATE_DIR"
+  : >"$STATE_DIR/agent-other-ag_one" # blue is exempt only while a token backs it
   for held in hold agents; do
     other=$(strand $$ "$held")
     age "$STATE_DIR/tty-other" 3600
     "$TAB_STATE" reset
     check "$CURRENT ($held)" "" "$(cat "$other")"
   done
+fi
+
+if it "a blue tab with no subagent left is cleared"; then
+  # Blue is only exempt while a token backs it; once the last one is gone or
+  # aged out, the tab ages out like a busy one. The live case: a token from
+  # 10:22 whose SubagentStop never came held a tab blue for six hours.
+  other=$(strand $$ agents)
+  age "$STATE_DIR/tty-other" 3600
+  : >"$STATE_DIR/agent-other-ag_stuck"
+  age "$STATE_DIR/agent-other-ag_stuck" 100000
+  "$TAB_STATE" reset
+  check "$CURRENT (cleared)" "$DEFAULT" "$(cat "$other")"
+  check "$CURRENT (token swept)" "absent" "$(exists "$STATE_DIR/agent-other-ag_stuck")"
 fi
 
 if it "an unrecognized state ages out instead of being spared forever"; then
