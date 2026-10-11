@@ -178,9 +178,19 @@ almost nothing per tool call.
   Tokens are keyed by tty as well, so a second session in another tab cannot
   color yours. If a `SubagentStop` never arrives, session boundaries drain the
   set, and every turn end — in any tab — drops tokens older than the TTL. The
-  token is an empty file whose mtime is its start time. The sweep used to run
-  only on agent events, so a tab that never saw another one stayed blue for
-  good; that was caught live, six hours after the lost `SubagentStop`.
+  token's mtime is its start time. The sweep used to run only on agent events,
+  so a tab that never saw another one stayed blue for good; that was caught
+  live, six hours after the lost `SubagentStop`.
+
+- **Subagents that die.** A subagent that dies on an API error, or that you
+  interrupt, sends no `SubagentStop`. Caught live: one died on "Prompt is too
+  long" and held its tab blue for the rest of the 2h TTL. So the token holds
+  the path of the subagent's own transcript, and every turn end reads its last
+  line (one `tail` per token). An API error or an interrupt there drops the
+  token. Of 363 subagents on one machine, those were the only two ways one
+  ended with no `SubagentStop`. Only the last line counts, so a subagent that
+  went on working after one is kept. The TTL stays as the backstop for a
+  subagent that hangs.
 
 - **Counting background shells.** No hook fires when a background shell ends,
   and a foreground command that hits its timeout is moved to the background
@@ -271,7 +281,8 @@ almost nothing per tool call.
   (0–255).
 - **Subagent staleness:** `TAB_STATE_AGENT_TTL_SEC` (default 7200, i.e. 2h) is
   how long a subagent whose `SubagentStop` never arrived is believed, rounded
-  up to whole minutes. Raise it if you run longer agents than that.
+  up to whole minutes. A subagent whose transcript shows it died is dropped
+  sooner, at the next turn end. Raise it if you run longer agents than that.
 - **Abandoned-tab timeout:** `TAB_STATE_BUSY_TTL_MIN` (default 30 minutes) is
   how long a green tab may go without a hook event before another tab's turn
   end clears it. Raise it if you routinely run single tool calls longer than
@@ -302,7 +313,8 @@ It starts a real Claude Code session in a temp dir with its own `--settings`
 (so it needs the `claude` binary and spends tokens — hence not in CI), then
 checks that `SubagentStart`/`SubagentStop` fire, that both carry `agent_id`,
 that **the two ids agree** — tokens would leak and the tab would stick blue if
-they ever stopped — and that `tab-state.sh` still parses the payloads as
+they ever stopped — that the subagent transcript `agent-start` records is the
+one `SubagentStop` names, and that `tab-state.sh` still parses the payloads as
 actually shipped rather than as fixtured. It does the same for slate
 (`CronCreate` returns the job id `CronDelete` takes), for magenta (a background
 shell carries `shell-snapshots`), and for the turns Claude Code starts by

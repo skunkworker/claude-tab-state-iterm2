@@ -23,6 +23,9 @@
 #      matching, tokens would leak and the tab would stick blue forever.
 #   3. tab-state.sh still extracts agent_id from the REAL payloads — the
 #      captured ones, not a fixture. Payloads gain fields over time.
+#      And the subagent transcript it derives from SubagentStart is the one
+#      SubagentStop names: a subagent that dies sends no SubagentStop, so
+#      that transcript is how the sweep learns of it.
 #   4. The events that drive the other colors still fire.
 #   5. Slate: CronCreate's real payload carries `recurring` and returns the job
 #      `id` that CronDelete then takes, and tab-state.sh's `schedule` turns the
@@ -149,6 +152,20 @@ check(bool(pid), "SubagentStop carries agent_id", repr(pid))
 check(bool(sid) and sid == pid, "the two agent_ids agree",
       "blue would stick forever otherwise")
 
+# tab-state.sh derives the subagent's transcript from SubagentStart, which
+# names only the session's. If the layout moved, a dead subagent would hold
+# the tab blue until the TTL again.
+session_tp = (start or {}).get("transcript_path") or ""
+derived = session_tp[:-len(".jsonl")] + "/subagents/agent-%s.jsonl" % sid \
+    if session_tp.endswith(".jsonl") and sid else ""
+named = os.path.expanduser((stop or {}).get("agent_transcript_path") or "")
+check(bool(session_tp), "SubagentStart carries transcript_path", repr(session_tp))
+check(bool(derived) and os.path.expanduser(derived) == named,
+      "the subagent transcript derived at start is the one SubagentStop names",
+      "%r vs %r" % (derived, named))
+check(bool(derived) and os.path.isfile(os.path.expanduser(derived)),
+      "the subagent transcript exists", derived)
+
 print()
 print("other events driving the colors")
 for event in ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop",
@@ -185,6 +202,9 @@ if start and stop and sid and sid == pid:
     tokens = [f for f in os.listdir(state_dir) if f.startswith("agent-")]
     check(len(tokens) == 1 and sid.replace("/", "_") in tokens[0],
           "the token is keyed by the real agent_id", str(tokens))
+    held = open(os.path.join(state_dir, tokens[0])).read().strip() if tokens else ""
+    check(bool(held) and held == derived,
+          "the token holds the subagent's transcript", repr(held))
 
     painted = run("agent-stop", stop)
     check(painted == GREEN, "agent-stop hands the tab back to green",
@@ -245,6 +265,8 @@ print()
 print("NOT COVERED from `claude -p`, each checked by other means:")
 print("  StopFailure `error` values: read from the Claude Code binary.")
 print("  ScheduleWakeup `stop` / `delaySeconds`: from its tool schema.")
+print("  How a subagent ends with no SubagentStop (API error, interrupt): from")
+print("  real subagent transcripts in ~/.claude/projects.")
 
 print()
 notif = [e for e in seen if e.startswith("NOTIF-")]

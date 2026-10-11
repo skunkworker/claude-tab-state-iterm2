@@ -161,8 +161,9 @@ any_match() { # path-prefix
 # One token file per outstanding subagent, keyed by the agent_id that both
 # SubagentStart and SubagentStop carry. Counting in a shared file would be a
 # read-modify-write race between the hook processes of agents that start and
-# finish concurrently; a glob has no such problem and needs no locking. The
-# file is empty: its mtime is the start time, which is all the sweep reads.
+# finish concurrently; a glob has no such problem and needs no locking. Its
+# mtime is the start time, and it holds the path of the subagent's own
+# transcript (see subagent_ended); both are for the sweep.
 agents_running() { any_match "${1:-$AGENT_GLOB}"; } # [glob-prefix]
 
 # One token per pending wake-up, holding "<due> <expires>" in epoch seconds:
@@ -258,13 +259,43 @@ outlives_turn() { # state tty-key owner-pid
   esac
 }
 
-# Drop every tab's subagent tokens older than the TTL. Here rather than on the
-# agent events because a tab whose SubagentStop never came may never see another
-# agent event. The fork-free probe first, so a turn with no agents anywhere
-# costs no `find`. Wake-up tokens expire by their own contents instead.
+# True if a subagent's transcript ends the way a subagent ends when no
+# SubagentStop follows: on an API error, or on your interrupt. Of 363
+# subagents on one machine, those two endings were the only ones with no
+# SubagentStop.
+#
+# Only the last line counts, so a subagent that went on working after either
+# one is not ended. The bounded tail keeps a multi-megabyte last line (a big
+# tool result) out of a bash variable. Both patterns are JSON structure, not
+# text: inside a JSON string their quotes would be escaped, so a tool result
+# that quotes one cannot match.
+subagent_ended() { # transcript
+  local last
+  last=$(tail -c 4096 "$1" 2>/dev/null) || return 1
+  case "${last##*$'\n'}" in
+    *'"isApiErrorMessage":true'* | \
+      *'"content":[{"type":"text","text":"[Request interrupted by user'*) return 0 ;;
+  esac
+  return 1
+}
+
+# Drop every tab's subagent tokens whose subagent has ended without a
+# SubagentStop, or that are older than the TTL — the backstop for a subagent
+# that hangs, or that ends in a way subagent_ended does not know. Here rather
+# than on the agent events because a tab whose SubagentStop never came may
+# never see another agent event. The fork-free probe first, so a turn with no
+# agents anywhere costs no fork. Then one `tail` per token that names a
+# transcript, once per turn end. Wake-up tokens expire by their own contents.
 sweep_agents() {
+  local f path
   agents_running "$STATE_DIR/agent-" || return 0
   find "$STATE_DIR" -maxdepth 1 -name 'agent-*' -mmin "+$AGENT_TTL_MIN" -delete 2>/dev/null
+  for f in "$STATE_DIR"/agent-*; do
+    # A token from before this format is empty, and a transcript not yet
+    # written says nothing; the TTL alone judges both.
+    IFS= read -r path 2>/dev/null <"$f" || continue
+    [ -f "$path" ] && subagent_ended "$path" && rm -f "$f" 2>/dev/null
+  done
 }
 
 # Clear tabs no hook will ever come back for, and drop what they left behind.
@@ -604,7 +635,14 @@ case "$state" in
     read_payload
     json_field agent_id
     [ -n "$FIELD" ] || exit 0
-    : >"${AGENT_GLOB}${FIELD//[^A-Za-z0-9_-]/_}" 2>/dev/null
+    id=$FIELD
+    # Only SubagentStop names the subagent's transcript; SubagentStart has the
+    # session's, and the subagent's lives beside it under a fixed name, nested
+    # ones included. A path this cannot parse names no file, so the sweep falls
+    # back on the TTL.
+    json_field transcript_path
+    printf '%s\n' "${FIELD:+${FIELD%.jsonl}/subagents/agent-$id.jsonl}" \
+      >"${AGENT_GLOB}${id//[^A-Za-z0-9_-]/_}" 2>/dev/null
     paint_agents
     ;;
   agent-stop)
