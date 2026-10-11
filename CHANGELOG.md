@@ -3,6 +3,35 @@
 Dated entries, newest first. This is a personal tool with no releases to
 version, so the date something landed is the useful thing to know.
 
+## 2026-10-11
+
+### Added
+
+- **Magenta: the turn is over, but background shells still run.** Seen live: a
+  turn ended at 22:46:44 while an `ssh` command kept running in the background
+  for another 12 minutes, and the tab showed the default color — the same as
+  "all done". No hook fires when a background shell ends, and that `ssh` never
+  asked for the background: it hit its 10-minute timeout and Claude Code moved
+  it there. So the turn end now asks the process table whether `claude` still
+  has a child shell (one `pgrep`, once per turn end). Blue still outranks it,
+  and green owns the tab while a turn runs. A background dev server keeps the
+  tab magenta until it stops; that is deliberate.
+- Magenta follows blue's rule in the foreign sweep: exempt while a shell backs
+  it, then aged out like `busy`.
+
+### Changed
+
+- `paint_busy`'s post-paint re-check now repaints whatever the turn end
+  painted, not always the default, so a `Stop` landing mid-paint keeps a
+  magenta tab magenta. `reset` and `agent-stop` share the same "what is left
+  after the turn" choice, `paint_after_turn`.
+
+### Fixed
+
+- The mid-paint race test could print "Interrupted system call", and could in
+  principle hang: its last write-open on the fifo raced a reader that was just
+  finishing. It now waits briefly, then opens read-write, which never blocks.
+
 ## 2026-09-30
 
 ### Fixed

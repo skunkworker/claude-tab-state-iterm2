@@ -9,12 +9,18 @@ or idle.
 | 🟢 green  | Claude is running | `UserPromptSubmit`, `PostToolUse` |
 | 🔵 blue   | waiting for subagents | `SubagentStart` / `SubagentStop` |
 | 🟡 yellow | Claude needs you (permission / question) | `Notification` (`permission_prompt`) |
+| 🟣 magenta | turn over, background shells still running | `Stop`, `StopFailure` |
 | default   | done / idle / session over | `Stop`, `StopFailure`, `SessionEnd`, `SessionStart` |
 
 Blue outranks green: while any subagent is outstanding the tab stays blue even
 as the parent keeps calling tools, and it stays blue after `Stop` — subagents
 outlive the turn that dispatched them, so a finished turn with work still
 running does not go dark.
+
+Magenta ranks last. It shows only once the turn is over and no subagent is
+left, while a shell Claude started in the background is still running. A
+background dev server counts, so a session that started one stays magenta until
+the server stops.
 
 ## Install
 
@@ -121,6 +127,16 @@ almost nothing per tool call.
   only on agent events, so a tab that never saw another one stayed blue for
   good; that was caught live, six hours after the lost `SubagentStop`.
 
+- **Counting background shells.** No hook fires when a background shell ends,
+  and a foreground command that hits its timeout is moved to the background
+  with nothing in any payload to say so. So there is nothing to count from
+  hooks; instead, `Stop` asks the process table. Every shell Claude Code starts
+  is a direct child of `claude` that sources a file from
+  `~/.claude/shell-snapshots`, so one `pgrep` answers "any left?". It runs once
+  per turn end, never on a tool call. When the last shell ends, Claude Code
+  wakes up to report it; the tool hooks of that turn find no shells and clear
+  the tab, and its `Stop` checks again.
+
 - **Not getting stuck.** `Stop` does not fire when the turn ends on an API error
   — Claude Code sends `StopFailure` instead, so both reset. Nor does it fire
   when you quit, which used to leave the tab green with nothing behind it —
@@ -169,8 +185,9 @@ almost nothing per tool call.
   others. Turn ends sweep as well, which only shortens the wait. An owner still
   alive keeps its tab unless its record has been `busy` and untouched for 30
   minutes, since every tool call rewrites it — waiting on you (yellow) is
-  exempt *by name*, and so is blue while a subagent token still backs it, both
-  being legitimately long-lived. A state added later ages out rather than
+  exempt *by name*, blue while a subagent token still backs it, and magenta
+  while its owner still has a background shell, all being legitimately
+  long-lived. A state added later ages out rather than
   silently becoming un-healable.
   Clearing a tab that turns out to still be working costs nothing: its next
   tool call repaints it.
@@ -191,11 +208,13 @@ almost nothing per tool call.
   removed: every pane shares one iTerm2 tab, so the signal cannot mean what it
   means everywhere else.
 - **No dependencies beyond bash.** `install.sh` needs `python3` to edit
-  `settings.json`; `tab-state.sh` itself shells out only to `ps` and `find`.
+  `settings.json`; `tab-state.sh` itself shells out only to `ps`, `find` and
+  `pgrep`.
 
 ## Customizing
 
-- **Colors:** edit the `set_color R G B` values in `tab-state.sh` (0–255).
+- **Colors:** edit the `R G B` values of the `paint` calls in `tab-state.sh`
+  (0–255).
 - **Subagent staleness:** `TAB_STATE_AGENT_TTL_SEC` (default 7200, i.e. 2h) is
   how long a subagent whose `SubagentStop` never arrived is believed, rounded
   up to whole minutes. Raise it if you run longer agents than that.

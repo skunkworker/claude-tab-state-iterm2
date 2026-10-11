@@ -141,6 +141,19 @@ must treat a short read as "skip", which is the cheap and honest option.
   after the turn ended, Claude Code wakes the main agent. If that wake-up sends
   no `UserPromptSubmit`, its tool hooks see a closed latch and the tab stays
   dark until `Stop`. The accepted false-dark trade-off, but now a common path
-  since subagents default to background (v2.1.198). Worth a probe case.
+  since subagents default to background (v2.1.198). Worth a probe case. A
+  background shell that ends wakes the agent the same way, so that turn runs
+  dark too once its first tool hook finds no shells left.
 - **Interrupt (Esc)** sends neither `Stop` nor `SessionEnd`. The tab stays
   green until the next prompt, the idle nudge, or the 30-minute foreign sweep.
+
+### 4. Magenta depends on a Claude Code internal
+
+`shells_running` in `tab-state.sh`
+
+It finds background shells by the `shell-snapshots` path on their command line.
+That is Claude Code's own detail, not a contract. If a release renames the dir
+or stops sourcing a snapshot, magenta silently never shows; it fails to the
+default color, so nothing gets stuck. A cheap guard: have `tests/probe-hooks.sh`
+start a background `sleep`, then check that `pgrep -P <claude> -f
+shell-snapshots` sees it.

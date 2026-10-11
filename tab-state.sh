@@ -102,7 +102,7 @@ reset_color() {
 #
 # A foreign sweep judges the record (see heal_registry); its mtime is the "last
 # seen busy" clock — free, versus a `date` fork on the hot path.
-register_tty() { # busy|agents|hold
+register_tty() { # busy|agents|hold|shells
   printf '%s %s %s\n' "$dev" "$owner" "$1" >"$TTY_RECORD" 2>/dev/null
 }
 unregister_tty() { rm -f "$TTY_RECORD" 2>/dev/null; }
@@ -142,17 +142,28 @@ agents_running() { # [glob-prefix] — fork-free: the hot path only asks "any?"
   return 1
 }
 
+# Background shells Claude Code left running are direct children of `claude`,
+# and each one starts by sourcing a file from ~/.claude/shell-snapshots. Asking
+# the process table is the only reliable count: no hook fires when a shell ends,
+# and a foreground command that hits its timeout moves to the background with
+# no flag in any payload. One fork, so never on the hot path.
+shells_running() { # owner-pid
+  pgrep -P "$1" -f shell-snapshots >/dev/null 2>&1
+}
+
 # States that legitimately outlive the turn that painted them: an unanswered
-# permission prompt, and blue for as long as a subagent token backs it. One
-# predicate for both the foreign sweep and our own tab, so the two cannot drift
-# apart. Testing by name rather than sweeping by name is deliberate — a state
-# added later ages out like `busy` instead of silently becoming un-healable.
-# Blue is tied to its tokens rather than exempt outright, so a lost
-# SubagentStop ends when the token ages out instead of never.
-outlives_turn() { # state tty-key
+# permission prompt, blue for as long as a subagent token backs it, and magenta
+# for as long as a background shell runs. One predicate for both the foreign
+# sweep and our own tab, so the two cannot drift apart. Testing by name rather
+# than sweeping by name is deliberate — a state added later ages out like
+# `busy` instead of silently becoming un-healable. Blue and magenta are tied to
+# what backs them rather than exempt outright, so a lost SubagentStop or a
+# shell that ended with no hook to say so ages out instead of holding forever.
+outlives_turn() { # state tty-key owner-pid
   case "$1" in
     hold) return 0 ;;
     agents) agents_running "${STATE_DIR}/agent-$2-" ;;
+    shells) shells_running "$3" ;;
     *) return 1 ;;
   esac
 }
@@ -183,7 +194,7 @@ heal_registry() {
     # A record with no owner predates this format; treat it as unowned. A tty
     # that is gone skips the question entirely — forget_tty writes nothing.
     if [ -w "$d" ] && [ -n "$o" ] && kill -0 "$o" 2>/dev/null; then
-      outlives_turn "$s" "${d##*/}" && continue
+      outlives_turn "$s" "${d##*/}" "$o" && continue
       # One fork for the whole sweep, and only once a live-owner record has
       # actually asked. `-mmin` lists the aged records, so the test itself stays
       # fork-free; the newline sentinels make an empty result non-empty, which
@@ -204,19 +215,33 @@ paint() { # state r g b
 }
 paint_agents() { paint agents 0 150 200; }
 
+# What a tab shows once its turn is over: the work that outlived the turn, else
+# nothing. Blue outranks magenta because a shell may be a server that never
+# ends, and it would hide the subagent for good.
+paint_after_turn() {
+  if agents_running; then
+    paint_agents
+  elif shells_running "$owner"; then
+    paint shells 200 0 200
+  else
+    reset_color
+  fi
+}
+
 # Busy means green normally, blue while subagents are outstanding.
 #
 # The green re-reads the latch after painting: every caller reaches here by
 # testing it first, and a Stop landing between that test and the brushstroke
-# leaves our color on top of its reset with no further hook coming to undo it.
-# It lives here rather than in one arm so no future paint site can forget it;
-# it costs one failed open, and blue is exempt because subagents outlive Stop.
+# leaves our color on top of Stop's with no further hook coming to undo it, so
+# this repaints what Stop did. It lives here rather than in one arm so no
+# future paint site can forget it; it costs one failed open, and blue is exempt
+# because subagents outlive Stop.
 paint_busy() {
   if agents_running; then
     paint_agents
   else
     paint busy 0 170 0
-    turn_is_closed && reset_color
+    turn_is_closed && paint_after_turn
   fi
 }
 
@@ -320,7 +345,7 @@ case "$state" in
       # registered in a state that should not have survived the turn, this is
       # the last hook that will ever visit, so it clears it instead.
       read -r _ _ shown 2>/dev/null <"$TTY_RECORD" &&
-        ! outlives_turn "$shown" "$key" && reset_color
+        ! outlives_turn "$shown" "$key" "$owner" && reset_color
       exit 0
     fi
     paint_busy
@@ -337,13 +362,9 @@ case "$state" in
     # terminal has of being cleaned up. First, so the stale-token sweep inside
     # it also decides our own color below.
     heal_registry
-    # Subagents outlive the turn that dispatched them, so a finished turn with
-    # work still outstanding stays blue rather than going dark.
-    if agents_running; then
-      paint_agents
-    else
-      reset_color
-    fi
+    # Subagents and background shells outlive the turn that started them, so a
+    # finished turn with work still outstanding shows it rather than going dark.
+    paint_after_turn
     ;;
   session)
     # A compact is not a boundary: `SessionStart` fires for it, but the turn
@@ -372,10 +393,8 @@ case "$state" in
     [ -n "$FIELD" ] || exit 0
     rm -f "${AGENT_GLOB}${FIELD//[^A-Za-z0-9_-]/_}" 2>/dev/null
     # Hand the tab back to whatever the turn is actually doing.
-    if agents_running; then
-      paint_agents
-    elif turn_is_closed; then
-      reset_color
+    if turn_is_closed; then
+      paint_after_turn
     else
       paint_busy
     fi
