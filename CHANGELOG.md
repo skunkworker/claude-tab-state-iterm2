@@ -5,17 +5,6 @@ version, so the date something landed is the useful thing to know.
 
 ## 2026-10-11
 
-### Fixed
-
-- **A subagent that died held its tab blue for up to 2 hours.** Caught live: a
-  subagent died on "Prompt is too long", sent no `SubagentStop`, and its tab
-  stayed blue until the TTL. A subagent that you interrupt does the same.
-  `agent-start` now writes the subagent's transcript path into its token, and
-  every turn end reads that transcript's last line. An API error or an
-  interrupt there drops the token, so the tab clears at the next turn end. The
-  TTL stays for a subagent that hangs. Tokens from before this change are
-  empty, and the TTL alone judges them.
-
 ### Added
 
 - **Magenta: the turn is over, but background shells still run.** Seen live: a
@@ -77,6 +66,14 @@ version, so the date something landed is the useful thing to know.
 
 ### Fixed
 
+- **A subagent that died held its tab blue for up to 2 hours.** Caught live: a
+  subagent died on "Prompt is too long", sent no `SubagentStop`, and its tab
+  stayed blue until the TTL. A subagent that you interrupt does the same.
+  `agent-start` now writes the subagent's transcript path into its token, and
+  every turn end reads that transcript's last line. An API error or an
+  interrupt there drops the token, so the tab clears at the next turn end. The
+  TTL stays for a subagent that hangs. Tokens from before this change are
+  empty, and the TTL alone judges them.
 - The mid-paint race test could print "Interrupted system call", and could in
   principle hang: its last write-open on the fifo raced a reader that was just
   finishing. It now waits briefly, then opens read-write, which never blocks.
