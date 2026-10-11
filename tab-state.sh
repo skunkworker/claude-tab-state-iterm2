@@ -293,8 +293,8 @@ sweep_agents() {
   for f in "$STATE_DIR"/agent-*; do
     # A token from before this format is empty, and a transcript not yet
     # written says nothing; the TTL alone judges both.
-    IFS= read -r path 2>/dev/null <"$f" && [ -f "$path" ] || continue
-    subagent_ended "$path" && rm -f "$f" 2>/dev/null
+    IFS= read -r path 2>/dev/null <"$f" || continue
+    [ -f "$path" ] && subagent_ended "$path" && rm -f "$f" 2>/dev/null
   done
 }
 
