@@ -286,6 +286,10 @@ shellcheck --severity=style *.sh tests/*.sh
 shfmt -d .             # flagless: takes its settings from .editorconfig
 ```
 
+CI pins shellcheck 0.11.0 and shfmt 3.14.1, the versions Homebrew ships, so a
+local run and CI agree. Bump the pins in `.github/workflows/ci.yml` when you
+upgrade the tools.
+
 Tests drive the scripts through env seams rather than a real terminal:
 `TAB_STATE_DEV` redirects the escapes into a file, `TAB_STATE_FORCE=1` skips
 iTerm2 detection, and `HOME` points at a sandbox so flag files, stop markers and

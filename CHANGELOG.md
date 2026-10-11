@@ -63,6 +63,8 @@ version, so the date something landed is the useful thing to know.
   equals a key's name is no longer read as that key.
 - `forget_tty` and the disable drain reach every kind of record by glob, so a
   kind added later needs no edit there. Session boundaries reuse `forget_tty`.
+- CI pins shellcheck 0.11.0 and shfmt 3.14.1, the versions Homebrew ships.
+  Ubuntu's shellcheck (0.9.0) flagged a line that a local 0.11.0 run passed.
 
 ### Fixed
 

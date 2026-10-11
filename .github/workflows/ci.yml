@@ -10,11 +10,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      # Pinned to what Homebrew ships, so a local lint run and CI agree. Ubuntu's
+      # apt shellcheck lagged (0.9.0) and flagged what 0.11.0 passes. Bump both
+      # pins when you upgrade the tools locally.
+      - run: |
+          curl -fsSL https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz | tar -xJ
+          sudo install shellcheck-v0.11.0/shellcheck /usr/local/bin/
+          shellcheck --version
       - run: shellcheck --severity=style ./*.sh tests/*.sh
       # No flags: shfmt takes indent_style/indent_size/switch_case_indent from
       # .editorconfig, so CI and your editor cannot disagree.
       - uses: mfinelli/setup-shfmt@v3
+        with:
+          shfmt-version: 3.14.1
       - run: shfmt -d .
 
   test:
