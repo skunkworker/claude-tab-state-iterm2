@@ -18,6 +18,33 @@ version, so the date something landed is the useful thing to know.
   tab magenta until it stops; that is deliberate.
 - Magenta follows blue's rule in the foreign sweep: exempt while a shell backs
   it, then aged out like `busy`.
+- **Red: the turn died on an API error.** `StopFailure` used to reset the tab,
+  so a failed turn looked the same as a finished one. It now reads the payload's
+  `error` field and paints red, and the color stays until your next prompt. A
+  `StopFailure` with no turn open — Claude Code's own post-turn work failing —
+  is ignored.
+- **Orange: stopped on a rate or usage limit.** The `rate_limit` error gets its
+  own color, because Claude Code may resume the task by itself when the limit
+  resets. The `Stop` of a resumed turn clears it; otherwise your next prompt.
+- **Slate: a wake-up is scheduled.** A `/loop` wake-up or a cron job means the
+  session will act again with nobody prompting it. A `PostToolUse` entry
+  matched to `ScheduleWakeup`, `CronCreate` and `CronDelete` records one token
+  per wake-up with its due time. A one-shot is dropped by the prompt that is
+  its firing, not by any prompt, and expires 15 minutes after it was due.
+  Cron tokens are named by job id, so `CronDelete` drops exactly its own job.
+- **More kinds of "needs you" turn the tab yellow:** an MCP server asking for
+  input (`elicitation_dialog`, `elicitation_url_dialog`), and a background
+  agent or teammate asking (`agent_needs_input`, `worker_permission_prompt`).
+  Before, the tab stayed green while Claude waited for you. A yellow raised
+  after the turn now stays through the idle nudge, other subagents finishing
+  and a compact, until a prompt or a `Stop` settles it.
+- **A manual `/compact` on an idle tab shows green** until it finishes
+  (`PreCompact` / `PostCompact`, gated to Claude Code 2.1.76). It does not paint
+  over any other after-turn color.
+- `tests/probe-hooks.sh` checks the new contracts against a real session:
+  `CronCreate` returns the job id that `CronDelete` takes, a background shell
+  carries `shell-snapshots`, and a turn a task notification starts sends
+  `UserPromptSubmit`.
 
 ### Changed
 
@@ -25,12 +52,27 @@ version, so the date something landed is the useful thing to know.
   painted, not always the default, so a `Stop` landing mid-paint keeps a
   magenta tab magenta. `reset` and `agent-stop` share the same "what is left
   after the turn" choice, `paint_after_turn`.
+- **Magenta is pinker: `255 90 220`, was `200 0 200`.** The old shade and blue
+  were hard to tell apart with deuteranopia, the most common color-blindness
+  (CIE76 ΔE 7.5 after simulation). The weakest pair in the full set is now
+  green and orange under protanopia, at 11.5.
+- `idle_prompt` is wired to a new `idle` state instead of `reset`, so the idle
+  nudge cannot erase a failure. Re-run `install.sh` to pick up the new wiring.
+- `json_field` also reads bare values such as `true`, which the scheduling
+  tools need, and matches a key only with its colon, so a string value that
+  equals a key's name is no longer read as that key.
+- `forget_tty` and the disable drain reach every kind of record by glob, so a
+  kind added later needs no edit there. Session boundaries reuse `forget_tty`.
 
 ### Fixed
 
 - The mid-paint race test could print "Interrupted system call", and could in
   principle hang: its last write-open on the fifo raced a reader that was just
   finishing. It now waits briefly, then opens read-write, which never blocks.
+- `tests/probe-hooks.sh` could report "SubagentStart carries no agent_id" on a
+  healthy Claude Code. Its hooks appended to one shared log, and a background
+  subagent's `SubagentStart` runs alongside the Agent tool's `PostToolUse`, so
+  the two lines interleaved. Each hook call now writes its own file.
 
 ## 2026-09-30
 

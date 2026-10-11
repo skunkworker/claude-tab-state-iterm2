@@ -24,10 +24,16 @@
 #   3. tab-state.sh still extracts agent_id from the REAL payloads — the
 #      captured ones, not a fixture. Payloads gain fields over time.
 #   4. The events that drive the other colors still fire.
+#   5. Slate: CronCreate's real payload carries `recurring` and returns the job
+#      `id` that CronDelete then takes, and tab-state.sh's `schedule` turns the
+#      pair into a token and back. Tokens are named by that id.
+#   6. Magenta: a background shell is a child of `claude` with
+#      `shell-snapshots` on its command line, which is all the script looks for.
 #
-# It canNOT check the two Notification matchers: permission_prompt needs an
-# interactive permission prompt, and idle_prompt fires ~60s into an interactive
-# idle. Neither is reachable from `claude -p`. See the note it prints.
+# It canNOT check, from `claude -p`: the Notification matchers (they need an
+# interactive prompt or ~60s of interactive idle), StopFailure (it needs a real
+# API error), ScheduleWakeup (only a /loop has it), or whether a turn Claude
+# Code starts by itself sends UserPromptSubmit. See the notes it prints.
 
 set -u
 
@@ -52,16 +58,26 @@ cleanup() {
 }
 trap cleanup EXIT
 
-LOG="$SANDBOX/events.log"
-: >"$LOG"
+EVENTS="$SANDBOX/events"
+mkdir -p "$EVENTS"
 
-# Flatten each payload onto one line so the log stays greppable. JSON escapes
-# newlines inside strings, so nothing is lost.
+# One file per hook call, named after its event. Hooks run in parallel — a
+# background subagent's SubagentStart lands with the Agent tool's PostToolUse —
+# and appends to one shared log interleave mid-line.
+#
+# After each PostToolUse it also records how many background shells the
+# session has, counted the way tab-state.sh counts them. The hook may run under
+# a `sh -c`, so it asks both its parent and its grandparent.
 cat >"$SANDBOX/probe.sh" <<EOF
 #!/bin/bash
-printf '%s ' "\$1" >>"$LOG"
-tr -d '\n' >>"$LOG"
-printf '\n' >>"$LOG"
+cat >"\$(mktemp "$EVENTS/\$1.XXXXXX")"
+if [ "\$1" = PostToolUse ]; then
+  n=0
+  for p in \$PPID \$(ps -o ppid= -p \$PPID); do
+    n=\$((n + \$(pgrep -P "\$p" -f shell-snapshots 2>/dev/null | wc -l)))
+  done
+  echo "\$n" >"\$(mktemp "$EVENTS/SHELLS.XXXXXX")"
+fi
 exit 0
 EOF
 chmod +x "$SANDBOX/probe.sh"
@@ -85,8 +101,9 @@ PY
 echo "probe: starting a real Claude Code session (this spends tokens)..."
 (
   cd "$SANDBOX" || exit 1
-  claude --settings ./settings.json --allowedTools Task --permission-mode acceptEdits \
-    -p 'Use the Task tool exactly once with subagent_type general-purpose and the prompt "reply with the single word pong". Then reply with just that word.'
+  claude --settings ./settings.json --permission-mode acceptEdits \
+    --allowedTools 'Task,Bash(sleep 20),CronCreate,CronDelete,ToolSearch' \
+    -p 'Do these steps in order, one tool call each. 1) Use the Task tool exactly once with subagent_type general-purpose and the prompt "reply with the single word pong". 2) Use the Bash tool with run_in_background set to true to run: sleep 20 3) Use CronCreate with cron "17 3 1 1 *", prompt "probe", and recurring false. 4) Use CronDelete with the id that CronCreate returned. Then reply with just the word pong.'
 ) >"$SANDBOX/session.out" 2>&1 || {
   echo "probe: the Claude Code session failed:" >&2
   tail -20 "$SANDBOX/session.out" >&2
@@ -94,19 +111,18 @@ echo "probe: starting a real Claude Code session (this spends tokens)..."
 }
 
 echo
-python3 - "$LOG" "$SANDBOX" "$ROOT/tab-state.sh" <<'PY'
+python3 - "$EVENTS" "$SANDBOX" "$ROOT/tab-state.sh" <<'PY'
 import json, os, subprocess, sys, tempfile
 
-log, sandbox, tab_state = sys.argv[1], sys.argv[2], sys.argv[3]
+events, sandbox, tab_state = sys.argv[1], sys.argv[2], sys.argv[3]
 
+# In the order they were written, which is the order the hooks ran.
 seen = {}
-for line in open(log):
-    line = line.strip()
-    if not line or " " not in line:
-        continue
-    event, _, raw = line.partition(" ")
+paths = [os.path.join(events, f) for f in os.listdir(events)]
+for path in sorted(paths, key=os.path.getmtime):
+    event = os.path.basename(path).split(".")[0]
     try:
-        seen.setdefault(event, []).append(json.loads(raw))
+        seen.setdefault(event, []).append(json.load(open(path)))
     except ValueError:
         seen.setdefault(event, []).append({})
 
@@ -177,6 +193,58 @@ if start and stop and sid and sid == pid:
     check(not tokens, "no token leaked", str(tokens))
 else:
     check(False, "cannot exercise tab-state.sh", "the subagent contract failed above")
+
+# Slate. Real payloads only: a fixture would only prove the script agrees with
+# whoever wrote the fixture.
+print()
+print("scheduling contract (slate)")
+posts = seen.get("PostToolUse", [])
+create = next((e for e in posts if e.get("tool_name") == "CronCreate"), None)
+delete = next((e for e in posts if e.get("tool_name") == "CronDelete"), None)
+check(create is not None, "PostToolUse fires for CronCreate")
+check(delete is not None, "PostToolUse fires for CronDelete")
+resp = (create or {}).get("tool_response")
+job = resp.get("id") if isinstance(resp, dict) else None
+check(bool(job), "CronCreate's tool_response carries the job id", repr(resp)[:120])
+check((create or {}).get("tool_input", {}).get("recurring") is False,
+      "CronCreate's tool_input carries recurring:false")
+check(bool(job) and (delete or {}).get("tool_input", {}).get("id") == job,
+      "CronDelete takes the same id", "a delete would miss its token otherwise")
+if create and delete and job:
+    home = os.path.join(sandbox, "schedhome")
+    os.makedirs(os.path.join(home, ".claude"), exist_ok=True)
+    dev = os.path.join(sandbox, "schedout")
+    open(dev, "w").close()
+    env = dict(os.environ, HOME=home, TAB_STATE_DEV=dev, TAB_STATE_FORCE="1")
+    env.pop("TMUX", None)
+    env.pop("STY", None)
+    wake = os.path.join(home, ".claude", ".tab-state", "wake-schedout-at-" + job)
+    for payload, want, label in ((create, True, "schedule records the real CronCreate"),
+                                 (delete, False, "schedule drops it on the real CronDelete")):
+        subprocess.run(["bash", tab_state, "schedule"], input=json.dumps(payload),
+                       text=True, env=env, check=False)
+        check(os.path.exists(wake) == want, label, os.path.basename(wake))
+
+print()
+print("background shells (magenta)")
+shells = [n for n in seen.get("SHELLS", []) if isinstance(n, int)]
+check(any(n >= 1 for n in shells), "a background shell carries shell-snapshots",
+      "counts seen: %s" % shells)
+
+# Orange, slate and the after-turn yellow all rely on the turn Claude Code
+# starts by itself — here, to report the background agent and shell — opening
+# with UserPromptSubmit, like a prompt you type.
+print()
+print("turns Claude Code starts by itself")
+woken = [e for e in seen.get("UserPromptSubmit", [])
+         if "<task-notification>" in str(e.get("prompt", ""))]
+check(bool(woken), "a task notification's turn sends UserPromptSubmit",
+      "%d such turn(s)" % len(woken))
+
+print()
+print("NOT COVERED from `claude -p`, each checked by other means:")
+print("  StopFailure `error` values: read from the Claude Code binary.")
+print("  ScheduleWakeup `stop` / `delaySeconds`: from its tool schema.")
 
 print()
 notif = [e for e in seen if e.startswith("NOTIF-")]

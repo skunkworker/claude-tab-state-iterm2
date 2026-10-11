@@ -26,7 +26,10 @@ BEL=$'\007'
 GREEN="${ESC}]6;1;bg;red;brightness;0${BEL}${ESC}]6;1;bg;green;brightness;170${BEL}${ESC}]6;1;bg;blue;brightness;0${BEL}"
 YELLOW="${ESC}]6;1;bg;red;brightness;235${BEL}${ESC}]6;1;bg;green;brightness;190${BEL}${ESC}]6;1;bg;blue;brightness;0${BEL}"
 BLUE="${ESC}]6;1;bg;red;brightness;0${BEL}${ESC}]6;1;bg;green;brightness;150${BEL}${ESC}]6;1;bg;blue;brightness;200${BEL}"
-MAGENTA="${ESC}]6;1;bg;red;brightness;200${BEL}${ESC}]6;1;bg;green;brightness;0${BEL}${ESC}]6;1;bg;blue;brightness;200${BEL}"
+MAGENTA="${ESC}]6;1;bg;red;brightness;255${BEL}${ESC}]6;1;bg;green;brightness;90${BEL}${ESC}]6;1;bg;blue;brightness;220${BEL}"
+RED="${ESC}]6;1;bg;red;brightness;190${BEL}${ESC}]6;1;bg;green;brightness;20${BEL}${ESC}]6;1;bg;blue;brightness;20${BEL}"
+ORANGE="${ESC}]6;1;bg;red;brightness;240${BEL}${ESC}]6;1;bg;green;brightness;110${BEL}${ESC}]6;1;bg;blue;brightness;0${BEL}"
+SLATE="${ESC}]6;1;bg;red;brightness;110${BEL}${ESC}]6;1;bg;green;brightness;115${BEL}${ESC}]6;1;bg;blue;brightness;140${BEL}"
 DEFAULT="${ESC}]6;1;bg;*;default${BEL}"
 
 setup() {
@@ -137,7 +140,7 @@ if it "rejects a missing argument"; then
   err=$("$TAB_STATE" 2>&1 >/dev/null)
   check "$CURRENT: exit 1" "1" "$?"
   check "$CURRENT: prints usage" \
-    "usage: tab-state.sh {start|green|yellow|reset|session|agent-start|agent-stop}" "$err"
+    "usage: tab-state.sh {start|green|yellow|reset|idle|failure|session|agent-start|agent-stop|compact-start|compact-end|schedule}" "$err"
 fi
 
 if it "rejects an unknown state"; then
@@ -173,9 +176,9 @@ fi
 
 # ------------------------------------------------------------ notification path
 
-# The permission_prompt / idle_prompt matchers do the splitting now, so yellow
-# paints unconditionally and reads no payload at all. The idle nudge is wired
-# to `reset` and is covered by the reset tests.
+# The Notification matchers do the splitting now, so yellow paints
+# unconditionally and reads no payload at all. The idle nudge is wired to
+# `idle`, covered with the after-turn colors below.
 if it "yellow paints regardless of the payload"; then
   echo '{"message":"Claude is waiting for your input"}' | "$TAB_STATE" yellow
   check "$CURRENT (ignores stdin)" "$YELLOW" "$(out)"
@@ -512,7 +515,7 @@ if it "the idle nudge keeps the tab magenta"; then
   spawn_shell
   "$TAB_STATE" reset
   clear_out
-  "$TAB_STATE" reset
+  "$TAB_STATE" idle
   check "$CURRENT" "$MAGENTA" "$(out)"
 fi
 
@@ -550,7 +553,399 @@ if it "a session boundary does not paint magenta"; then
   check "$CURRENT" "$DEFAULT" "$(out)"
 fi
 
+# ---------------------------------------------------------- failed turn colour
+
+fail_with() { printf '{"hook_event_name":"StopFailure","error":"%s"}' "$1" | "$TAB_STATE" failure; }
+fail_marker() { cat "$STATE_DIR/fail-out" 2>/dev/null; }
+
+if it "an API error turns the tab red"; then
+  "$TAB_STATE" start
+  clear_out
+  fail_with overloaded
+  check "$CURRENT (painted)" "$RED" "$(out)"
+  check "$CURRENT (registered)" "failed" "$(shown)"
+  check "$CURRENT (turn closed)" "absent" "$(exists "$MARKER")"
+fi
+
+if it "a usage limit turns the tab orange"; then
+  "$TAB_STATE" start
+  clear_out
+  fail_with rate_limit
+  check "$CURRENT (painted)" "$ORANGE" "$(out)"
+  check "$CURRENT (registered)" "paused" "$(shown)"
+fi
+
+if it "an error type added later counts as failed"; then
+  "$TAB_STATE" start
+  fail_with some_future_error
+  check "$CURRENT (unknown type)" "failed" "$(fail_marker)"
+  echo '{"hook_event_name":"StopFailure"}' | "$TAB_STATE" failure
+  check "$CURRENT (no error field)" "failed" "$(fail_marker)"
+fi
+
+if it "the idle nudge keeps a failure showing"; then
+  "$TAB_STATE" start
+  fail_with overloaded
+  clear_out
+  "$TAB_STATE" idle
+  check "$CURRENT" "$RED" "$(out)"
+fi
+
+if it "the next prompt clears a failure"; then
+  "$TAB_STATE" start
+  fail_with overloaded
+  clear_out
+  "$TAB_STATE" start
+  check "$CURRENT (green)" "$GREEN" "$(out)"
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (then default)" "$DEFAULT" "$(out)"
+fi
+
+if it "a Stop clears a pause that resumed by itself"; then
+  # Claude Code resumes a usage-limit pause on its own; that turn may send no
+  # prompt hook, but it ends with a Stop.
+  "$TAB_STATE" start
+  fail_with rate_limit
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (default)" "$DEFAULT" "$(out)"
+  check "$CURRENT (marker gone)" "absent" "$(exists "$STATE_DIR/fail-out")"
+fi
+
+if it "a green after the turn closed spares a failure"; then
+  "$TAB_STATE" start
+  fail_with overloaded
+  clear_out
+  "$TAB_STATE" green
+  check "$CURRENT (untouched)" "" "$(out)"
+  check "$CURRENT (still registered)" "present" "$(exists "$REGISTRY")"
+fi
+
+if it "red outranks blue, which outranks orange"; then
+  "$TAB_STATE" start
+  agent agent-start ag_one
+  clear_out
+  fail_with overloaded
+  check "$CURRENT (red over blue)" "$RED" "$(out)"
+  "$TAB_STATE" start
+  clear_out
+  fail_with rate_limit
+  check "$CURRENT (blue over orange)" "$BLUE" "$(out)"
+  clear_out
+  agent agent-stop ag_one
+  check "$CURRENT (then orange)" "$ORANGE" "$(out)"
+fi
+
+if it "orange outranks magenta"; then
+  "$TAB_STATE" start
+  spawn_shell
+  clear_out
+  fail_with rate_limit
+  check "$CURRENT" "$ORANGE" "$(out)"
+fi
+
+if it "a failure after the turn closed is not yours to answer"; then
+  # Claude Code's own post-turn model work (titling, away summaries) runs with
+  # no turn around it; a StopFailure from it must not paint a good turn red.
+  "$TAB_STATE" start
+  "$TAB_STATE" reset
+  clear_out
+  fail_with overloaded
+  check "$CURRENT (untouched)" "" "$(out)"
+  check "$CURRENT (no marker)" "absent" "$(exists "$STATE_DIR/fail-out")"
+fi
+
+if it "a session boundary forgets a failure"; then
+  "$TAB_STATE" start
+  fail_with overloaded
+  "$TAB_STATE" session </dev/null
+  clear_out
+  "$TAB_STATE" idle
+  check "$CURRENT" "$DEFAULT" "$(out)"
+fi
+
+# ------------------------------------------------------- questions after a turn
+
+# A background agent or teammate can ask after the turn ended. No hook says it
+# was answered, so only the events that settle it may paint over the yellow.
+
+if it "a question after the turn survives the idle nudge"; then
+  "$TAB_STATE" start
+  agent agent-start ag_one
+  "$TAB_STATE" reset
+  "$TAB_STATE" yellow
+  clear_out
+  "$TAB_STATE" idle
+  check "$CURRENT (untouched)" "" "$(out)"
+  check "$CURRENT (still yellow)" "hold" "$(shown)"
+fi
+
+if it "a question after the turn survives another subagent finishing"; then
+  "$TAB_STATE" start
+  agent agent-start ag_one
+  agent agent-start ag_two
+  "$TAB_STATE" reset
+  "$TAB_STATE" yellow
+  clear_out
+  agent agent-stop ag_two
+  check "$CURRENT (untouched)" "" "$(out)"
+  check "$CURRENT (still yellow)" "hold" "$(shown)"
+fi
+
+if it "a question after the turn survives a compact"; then
+  "$TAB_STATE" start
+  "$TAB_STATE" reset
+  "$TAB_STATE" yellow
+  clear_out
+  "$TAB_STATE" compact-start
+  "$TAB_STATE" compact-end
+  check "$CURRENT" "" "$(out)"
+fi
+
+if it "a Stop settles a question"; then
+  "$TAB_STATE" start
+  "$TAB_STATE" reset
+  "$TAB_STATE" yellow
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT" "$DEFAULT" "$(out)"
+fi
+
+# ------------------------------------------------------- scheduled wake-ups
+
+schedule() { # tool input-json [response-json]
+  printf '{"hook_event_name":"PostToolUse","tool_name":"%s","tool_input":%s,"tool_response":%s}' \
+    "$1" "$2" "${3:-\"ok\"}" | "$TAB_STATE" schedule
+}
+job() { printf '{"id":"%s","humanSchedule":"x","recurring":%s,"durable":false}' "$1" "${2:-true}"; }
+WAKEUP='{"delaySeconds":600,"prompt":"check the deploy","reason":"waiting on CI"}'
+CRON='{"cron":"7 * * * *","prompt":"sweep PRs"}'
+ONESHOT='{"cron":"17 3 1 1 *","prompt":"new-year check","recurring":false}'
+
+wake_token() { cat "$STATE_DIR/wake-out-$1" 2>/dev/null; }
+set_token() { # name due-offset expires-offset, both seconds from now
+  local now
+  now=$(date +%s)
+  echo "$((now + $2)) $((now + $3))" >"$STATE_DIR/wake-out-$1"
+}
+
+if it "a pending wake-up turns a finished turn slate"; then
+  "$TAB_STATE" start
+  clear_out
+  schedule ScheduleWakeup "$WAKEUP"
+  check "$CURRENT (schedule paints nothing)" "" "$(out)"
+  "$TAB_STATE" reset
+  check "$CURRENT (painted)" "$SLATE" "$(out)"
+  check "$CURRENT (registered)" "asleep" "$(shown)"
+fi
+
+if it "stopping the loop clears the wake-up"; then
+  "$TAB_STATE" start
+  schedule ScheduleWakeup "$WAKEUP"
+  schedule ScheduleWakeup '{"stop": true}' # with a space, as some encoders write it
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT" "$DEFAULT" "$(out)"
+fi
+
+if it "a prompt before a wake-up is due keeps it"; then
+  "$TAB_STATE" start
+  schedule ScheduleWakeup "$WAKEUP"
+  "$TAB_STATE" reset
+  "$TAB_STATE" start
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT" "$SLATE" "$(out)"
+fi
+
+if it "the prompt a due wake-up fires drops it"; then
+  "$TAB_STATE" start
+  schedule ScheduleWakeup "$WAKEUP"
+  "$TAB_STATE" reset
+  set_token loop -60 840 # it fired a minute ago
+  "$TAB_STATE" start
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT" "$DEFAULT" "$(out)"
+fi
+
+if it "a wake-up that never fired expires"; then
+  "$TAB_STATE" start
+  schedule ScheduleWakeup "$WAKEUP"
+  set_token loop -2000 -1100
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (default)" "$DEFAULT" "$(out)"
+  check "$CURRENT (dropped)" "absent" "$(exists "$STATE_DIR/wake-out-loop")"
+fi
+
+if it "a recurring cron job outlives the next prompt"; then
+  "$TAB_STATE" start
+  schedule CronCreate "$CRON" "$(job j1)"
+  "$TAB_STATE" reset
+  "$TAB_STATE" start
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT" "$SLATE" "$(out)"
+fi
+
+if it "a recurring cron job expires after its lifetime"; then
+  "$TAB_STATE" start
+  schedule CronCreate "$CRON" "$(job j1)"
+  echo "0 $(($(date +%s) - 1))" >"$STATE_DIR/wake-out-cron-j1"
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT" "$DEFAULT" "$(out)"
+fi
+
+if it "a one-shot cron job waits for its date"; then
+  "$TAB_STATE" start
+  schedule CronCreate "$ONESHOT" "$(job j2 false)"
+  read -r due _ <<<"$(wake_token at-j2)"
+  now=$(date +%s)
+  if [ "${due:-0}" -gt "$now" ] && [ "$due" -lt $((now + 367 * 86400)) ]; then
+    check "$CURRENT (due next new year)" "yes" "yes"
+  else
+    check "$CURRENT (due next new year)" "within a year" "${due:-none}"
+  fi
+  "$TAB_STATE" reset
+  "$TAB_STATE" start # an unrelated prompt
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (still pending)" "$SLATE" "$(out)"
+  set_token at-j2 -30 870 # its firing
+  "$TAB_STATE" start
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (dropped once fired)" "$DEFAULT" "$(out)"
+fi
+
+if it "a one-shot cron job with no fixed date counts as due now"; then
+  "$TAB_STATE" start
+  schedule CronCreate '{"cron":"*/5 * * * *","prompt":"p","recurring":false}' "$(job j3 false)"
+  "$TAB_STATE" start
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT" "$DEFAULT" "$(out)"
+fi
+
+if it "CronDelete drops only its own job"; then
+  "$TAB_STATE" start
+  schedule CronCreate "$CRON" "$(job j1)"
+  schedule CronCreate "$CRON" "$(job j2)"
+  schedule CronDelete '{"id":"j1"}' '{"id":"j1"}'
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (other job pending)" "$SLATE" "$(out)"
+  schedule CronDelete '{"id":"j2"}' '{"id":"j2"}'
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (none left)" "$DEFAULT" "$(out)"
+fi
+
+if it "a CronCreate with no job id records nothing"; then
+  # A dark tab is the safe guess when the job cannot be told apart.
+  "$TAB_STATE" start
+  schedule CronCreate "$CRON"
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT" "$DEFAULT" "$(out)"
+fi
+
+if it "a value equal to a key name is not read as that key"; then
+  "$TAB_STATE" start
+  schedule ScheduleWakeup '{"delaySeconds":600,"prompt":"p","reason":"stop","x":true}'
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT" "$SLATE" "$(out)"
+fi
+
+if it "fields after a long prompt are still read"; then
+  long=$(printf '%*s' 10000 '' | tr ' ' x)
+  "$TAB_STATE" start
+  schedule CronCreate "{\"cron\":\"17 3 1 1 *\",\"prompt\":\"$long\",\"recurring\":false}" "$(job j4 false)"
+  check "$CURRENT (one-shot)" "present" "$(exists "$STATE_DIR/wake-out-at-j4")"
+  check "$CURRENT (not recurring)" "absent" "$(exists "$STATE_DIR/wake-out-cron-j4")"
+fi
+
+if it "magenta outranks slate"; then
+  "$TAB_STATE" start
+  schedule CronCreate "$CRON" "$(job j1)"
+  spawn_shell
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT" "$MAGENTA" "$(out)"
+fi
+
+if it "a session boundary forgets wake-ups"; then
+  "$TAB_STATE" start
+  schedule CronCreate "$CRON" "$(job j1)"
+  "$TAB_STATE" session </dev/null
+  clear_out
+  "$TAB_STATE" idle
+  check "$CURRENT" "$DEFAULT" "$(out)"
+fi
+
+if it "a green after the turn closed spares a pending wake-up"; then
+  "$TAB_STATE" start
+  schedule CronCreate "$CRON" "$(job j1)"
+  "$TAB_STATE" reset
+  clear_out
+  "$TAB_STATE" green
+  check "$CURRENT" "" "$(out)"
+fi
+
+# ----------------------------------------------------------- manual compaction
+
+if it "a manual compact on an idle tab shows busy until it ends"; then
+  "$TAB_STATE" start
+  "$TAB_STATE" reset
+  clear_out
+  "$TAB_STATE" compact-start
+  check "$CURRENT (busy)" "$GREEN" "$(out)"
+  clear_out
+  "$TAB_STATE" compact-end
+  check "$CURRENT (back to default)" "$DEFAULT" "$(out)"
+fi
+
+if it "a compact mid-turn paints nothing"; then
+  "$TAB_STATE" start
+  clear_out
+  "$TAB_STATE" compact-start
+  "$TAB_STATE" compact-end
+  check "$CURRENT" "" "$(out)"
+fi
+
+if it "a compact does not paint over a color that says more"; then
+  "$TAB_STATE" start
+  fail_with overloaded
+  clear_out
+  "$TAB_STATE" compact-start
+  check "$CURRENT (red kept)" "" "$(out)"
+  "$TAB_STATE" compact-end
+  check "$CURRENT (red restored)" "$RED" "$(out)"
+fi
+
+if it "a cancelled compact ends at the idle nudge"; then
+  "$TAB_STATE" start
+  "$TAB_STATE" reset
+  "$TAB_STATE" compact-start
+  clear_out
+  "$TAB_STATE" idle
+  check "$CURRENT" "$DEFAULT" "$(out)"
+fi
+
 # --------------------------------------------------------------- disable flag
+
+if it "disabling forgets failures and wake-ups"; then
+  "$TAB_STATE" start
+  schedule CronCreate "$CRON" "$(job j1)"
+  fail_with overloaded
+  : >"$DISABLED"
+  "$TAB_STATE" green
+  check "$CURRENT" "0" "$(find "$STATE_DIR" -name 'fail-*' -o -name 'wake-*' | wc -l | tr -d ' ')"
+fi
 
 if it "the disable flag clears painted tabs and drains the registry"; then
   "$TAB_STATE" start
@@ -792,6 +1187,36 @@ if it "a magenta tab with no shell left ages out"; then
   check "$CURRENT (deregistered)" "absent" "$(exists "$STATE_DIR/tty-other")"
 fi
 
+if it "a quiet red, orange or slate tab is spared while what backs it remains"; then
+  mkdir -p "$STATE_DIR"
+  echo "0 $(($(date +%s) + 3600))" >"$STATE_DIR/wake-other-cron-j1"
+  for held in failed paused asleep; do
+    other=$(strand $$ "$held")
+    echo "$held" >"$STATE_DIR/fail-other"
+    age "$STATE_DIR/tty-other" 3600
+    "$TAB_STATE" reset
+    check "$CURRENT ($held)" "" "$(cat "$other")"
+  done
+fi
+
+if it "a red, orange or slate tab with nothing behind it ages out"; then
+  for held in failed paused asleep; do
+    other=$(strand $$ "$held")
+    age "$STATE_DIR/tty-other" 3600
+    "$TAB_STATE" reset
+    check "$CURRENT ($held)" "$DEFAULT" "$(cat "$other")"
+  done
+fi
+
+if it "clearing a stranded tab drops its failure and wake-ups"; then
+  other=$(strand "$(dead_pid)" failed)
+  : >"$STATE_DIR/fail-other"
+  : >"$STATE_DIR/wake-other-loop"
+  "$TAB_STATE" reset
+  check "$CURRENT (failure)" "absent" "$(exists "$STATE_DIR/fail-other")"
+  check "$CURRENT (wake-up)" "absent" "$(exists "$STATE_DIR/wake-other-loop")"
+fi
+
 if it "an unrecognized state ages out instead of being spared forever"; then
   # Exemption is by name, so a state added later inherits the busy timeout
   # rather than silently becoming un-healable.
@@ -929,13 +1354,13 @@ print(sum(1 for gs in d.get("hooks",{}).values() for g in gs
 if it "install wires every event"; then
   seed_settings
   "$INSTALL" >/dev/null 2>&1
-  check "$CURRENT" "10" "$(count_hooks tab-state.sh)"
+  check "$CURRENT" "17" "$(count_hooks tab-state.sh)"
 fi
 
-if it "install wires both Notification matchers"; then
+if it "install wires every Notification matcher"; then
   seed_settings
   "$INSTALL" >/dev/null 2>&1
-  check "$CURRENT" "idle_prompt=reset permission_prompt=yellow" \
+  check "$CURRENT" "agent_needs_input=yellow elicitation_dialog=yellow elicitation_url_dialog=yellow idle_prompt=idle permission_prompt=yellow worker_permission_prompt=yellow" \
     "$(python3 -c 'import json,sys
 d=json.load(open(sys.argv[1]))
 out=[]
@@ -969,13 +1394,13 @@ if it "install leaves hand-wired events it does not ship"; then
 import json, sys
 p = sys.argv[1]
 d = json.load(open(p))
-d["hooks"]["PreCompact"] = [{"hooks": [
+d["hooks"]["TeammateIdle"] = [{"hooks": [
     {"type": "command", "command": "bash ~/.claude/tab-state.sh reset"}]}]
 json.dump(d, open(p, "w"))
 PY
   "$INSTALL" >/dev/null 2>&1
   check "$CURRENT" "1" \
-    "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["hooks"].get("PreCompact",[])))' "$SETTINGS")"
+    "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["hooks"].get("TeammateIdle",[])))' "$SETTINGS")"
 fi
 
 if it "install unwires PreToolUse left by an older install"; then
@@ -1011,7 +1436,7 @@ if it "install is idempotent"; then
   "$INSTALL" >/dev/null 2>&1
   "$INSTALL" >/dev/null 2>&1
   "$INSTALL" >/dev/null 2>&1
-  check "$CURRENT (ours)" "10" "$(count_hooks tab-state.sh)"
+  check "$CURRENT (ours)" "17" "$(count_hooks tab-state.sh)"
   check "$CURRENT (foreign)" "1" "$(count_hooks unrelated-tool)"
   check "$CURRENT (one backup)" "1" "$(find "$HOME/.claude" -name 'settings.json.bak*' | wc -l | tr -d ' ')"
 fi
@@ -1088,7 +1513,7 @@ if it "install skips the subagent events on Claude Code older than 2.0.43"; then
   seed_settings
   PATH="$(fake_claude 2.0.42)" "$INSTALL" >/dev/null 2>&1
   check "$CURRENT (skipped)" "0" "$(count_hooks agent-start)"
-  check "$CURRENT (rest wired)" "7" "$(count_hooks tab-state.sh)"
+  check "$CURRENT (rest wired)" "12" "$(count_hooks tab-state.sh)"
 fi
 
 # An API error ends the turn with StopFailure and no Stop, so without it a rate
@@ -1098,10 +1523,10 @@ has_event() { # event -> yes|no
 print("yes" if sys.argv[2] in json.load(open(sys.argv[1])).get("hooks",{}) else "no")' "$SETTINGS" "$1"
 }
 
-if it "install wires StopFailure to reset from 2.1.78"; then
+if it "install wires StopFailure to failure from 2.1.78"; then
   seed_settings
   PATH="$(fake_claude 2.1.78)" "$INSTALL" >/dev/null 2>&1
-  check "$CURRENT (2.1.78)" "reset" \
+  check "$CURRENT (2.1.78)" "failure" \
     "$(python3 -c 'import json,sys
 d=json.load(open(sys.argv[1]))
 print(d["hooks"]["StopFailure"][0]["hooks"][0]["command"].rsplit(" ",1)[1])' "$SETTINGS")"
@@ -1109,6 +1534,28 @@ print(d["hooks"]["StopFailure"][0]["hooks"][0]["command"].rsplit(" ",1)[1])' "$S
   PATH="$(fake_claude 2.1.77)" "$INSTALL" >/dev/null 2>&1
   check "$CURRENT (2.1.77 skipped)" "no" "$(has_event StopFailure)"
   check "$CURRENT (2.1.77 subagents kept)" "yes" "$(has_event SubagentStart)"
+fi
+
+if it "install gates the compaction pair at 2.1.76"; then
+  # One without the other would leave a manual /compact painted busy.
+  seed_settings
+  PATH="$(fake_claude 2.1.76)" "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT (2.1.76)" "yes yes" "$(has_event PreCompact) $(has_event PostCompact)"
+  seed_settings
+  PATH="$(fake_claude 2.1.75)" "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT (2.1.75 skipped)" "no no" "$(has_event PreCompact) $(has_event PostCompact)"
+fi
+
+if it "install matches only the scheduling tools to schedule"; then
+  # The schedule state reads the payload; every other tool call must not pay
+  # for that.
+  seed_settings
+  "$INSTALL" >/dev/null 2>&1
+  check "$CURRENT" "-=green ScheduleWakeup|CronCreate|CronDelete=schedule" \
+    "$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print(" ".join(sorted("%s=%s" % (g.get("matcher","-"), g["hooks"][0]["command"].rsplit(" ",1)[1])
+                      for g in d["hooks"]["PostToolUse"])))' "$SETTINGS")"
 fi
 
 if it "install wires the subagent events on 2.0.43 and newer"; then
@@ -1127,7 +1574,7 @@ if it "install follows a symlinked settings.json"; then
   ln -s "$real" "$SETTINGS"
   "$INSTALL" >/dev/null 2>&1
   check "$CURRENT (still a link)" "$real" "$(readlink "$SETTINGS")"
-  check "$CURRENT (target rewritten)" "10" \
+  check "$CURRENT (target rewritten)" "17" \
     "$(python3 -c 'import json,sys
 d=json.load(open(sys.argv[1]))
 print(sum(1 for gs in d.get("hooks",{}).values() for g in gs

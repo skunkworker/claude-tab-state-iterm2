@@ -1,14 +1,20 @@
 #!/bin/bash
 # Reflect Claude Code state in the iTerm2 tab via the native TAB COLOR.
-# Usage: tab-state.sh {start|green|yellow|reset|session|agent-start|agent-stop}
+# Usage: tab-state.sh {start|green|yellow|reset|idle|failure|session|
+#                      agent-start|agent-stop|compact-start|compact-end|schedule}
 #
-#   start        = a new turn began (opens the turn, then paints busy)
-#   green        = Claude is running
-#   yellow       = Claude needs you (permission / question prompt)
-#   reset        = turn over (Stop)
-#   session      = session boundary; also forgets any tracked subagents
-#   agent-start  = a subagent was dispatched
-#   agent-stop   = a subagent finished
+#   start          = a new turn began (opens the turn, then paints busy)
+#   green          = Claude is running
+#   yellow         = Claude needs you (permission, MCP input, an agent asking)
+#   reset          = turn over (Stop); also clears a failed or paused turn
+#   idle           = the idle nudge; like reset, but keeps a failure showing
+#   failure        = the turn died on an API error (StopFailure)
+#   session        = session boundary; forgets every record of the tab
+#   agent-start    = a subagent was dispatched
+#   agent-stop     = a subagent finished
+#   compact-start  = compaction began (PreCompact)
+#   compact-end    = compaction finished (PostCompact)
+#   schedule       = a wake-up was scheduled or cancelled (PostToolUse)
 #
 # Installed from github.com/skunkworker/claude-tab-state-iterm2.
 #
@@ -47,6 +53,13 @@ AGENT_TTL_MIN=$(((${TAB_STATE_AGENT_TTL_SEC:-7200} + 59) / 60))
 # record, so only one very slow tool call goes this quiet mid-turn. Minutes,
 # because `find -mmin` is what ages the registry.
 BUSY_TTL_MIN="${TAB_STATE_BUSY_TTL_MIN:-30}"
+
+# Wake-up tokens carry their own expiry, read without `find`. A one-shot is
+# believed until this long after it was due: wake-ups fire only while the
+# session is idle, so a busy session fires them late. A recurring cron job is
+# believed for its 7-day lifetime plus an hour.
+WAKE_GRACE_SEC=900
+CRON_LIFE_SEC=608400
 
 # ------------------------------------------------------------------ functions
 
@@ -102,19 +115,25 @@ reset_color() {
 #
 # A foreign sweep judges the record (see heal_registry); its mtime is the "last
 # seen busy" clock — free, versus a `date` fork on the hot path.
-register_tty() { # busy|agents|hold|shells
+register_tty() { # busy|agents|hold|shells|failed|paused|asleep
   printf '%s %s %s\n' "$dev" "$owner" "$1" >"$TTY_RECORD" 2>/dev/null
 }
 unregister_tty() { rm -f "$TTY_RECORD" 2>/dev/null; }
 
 # Clear a tab we are giving up on and drop every record keyed to it. Takes only
-# the tty: every record this drops is keyed by that name, the registry entry
-# naming it included.
+# the tty: every record is named `<kind>-<tty>` or `<kind>-<tty>-<id>`, the
+# registry entry included, so two globs reach them all and a kind added later
+# needs no edit here. Ids are sanitized to [A-Za-z0-9_-] and never end in a tty
+# name, so the globs cannot reach another tab's records.
 forget_tty() { # tty
   [ -w "$1" ] && printf '%b' "$RESET_SEQ" >"$1" 2>/dev/null
   local key=${1##*/}
-  rm -f "${STATE_DIR}/tty-$key" "${STATE_DIR}/open-$key" "${STATE_DIR}/agent-$key-"* 2>/dev/null
+  rm -f "$STATE_DIR"/*-"$key" "$STATE_DIR"/*-"$key"-* 2>/dev/null
 }
+
+# The clock, read once per run and only when something needs it: bash 3.2 has
+# no builtin for it, so it costs a `date` fork.
+read_clock() { [ -n "${NOW:-}" ] || NOW=$(date +%s); }
 
 # True while the turn is closed. `start` opens it, `reset` closes it — a latch,
 # because nothing in the payload can order a PostToolUse green against the Stop
@@ -128,18 +147,87 @@ forget_tty() { # tty
 # green for good. It also exists only during a turn, so nothing accumulates.
 turn_is_closed() { [ ! -e "$OPEN_MARKER" ]; }
 
+# True if any file starts with this path. Fork-free: the hot path only asks
+# "any?".
+any_match() { # path-prefix
+  local f
+  for f in "$1"*; do
+    [ -e "$f" ] && return 0
+    break
+  done
+  return 1
+}
+
 # One token file per outstanding subagent, keyed by the agent_id that both
 # SubagentStart and SubagentStop carry. Counting in a shared file would be a
 # read-modify-write race between the hook processes of agents that start and
 # finish concurrently; a glob has no such problem and needs no locking. The
 # file is empty: its mtime is the start time, which is all the sweep reads.
-agents_running() { # [glob-prefix] — fork-free: the hot path only asks "any?"
-  local f
-  for f in "${1:-$AGENT_GLOB}"*; do
-    [ -e "$f" ] && return 0
-    break
+agents_running() { any_match "${1:-$AGENT_GLOB}"; } # [glob-prefix]
+
+# One token per pending wake-up, holding "<due> <expires>" in epoch seconds:
+# `loop` for the ScheduleWakeup of a /loop (one at a time), `at-<job>` for a
+# one-shot cron job, `cron-<job>` for a recurring one (due 0: it never fires
+# for the last time on a known date). Claude Code sends no hook when one fires,
+# so a one-shot is believed until it is overdue, and the prompt its firing
+# starts drops it early (see drop_fired_wakeups).
+#
+# True while any token has not expired, dropping the ones that have. Forks
+# `date` only when a token exists.
+wake_pending() { # [glob-prefix]
+  local prefix=${1:-$WAKE_GLOB} f due expires pending=1
+  any_match "$prefix" || return 1
+  read_clock
+  for f in "$prefix"*; do
+    read -r due expires 2>/dev/null <"$f" || continue
+    if [ "${expires:-0}" -gt "$NOW" ] 2>/dev/null; then
+      pending=0
+    else
+      rm -f "$f" 2>/dev/null
+    fi
   done
-  return 1
+  return $pending
+}
+
+# The prompt a one-shot wake-up enqueues arrives as a prompt, so `start` drops
+# every one-shot that is due by now. A prompt you type before that leaves it
+# alone. Cron jobs may fire up to 90s early, hence the slack.
+drop_fired_wakeups() {
+  local f due expires
+  any_match "$WAKE_GLOB" || return 0
+  read_clock
+  for f in "$WAKE_GLOB"*; do
+    read -r due expires 2>/dev/null <"$f" || continue
+    [ "${due:-0}" -gt 0 ] && [ "$NOW" -ge $((due - 90)) ] && rm -f "$f" 2>/dev/null
+  done
+  return 0
+}
+
+# Epoch seconds for a one-shot cron job's pinned "M H DoM Mon *", the next time
+# it comes round; empty when the fields are not plain numbers. BSD date first,
+# then GNU, so the tests run on Linux too.
+cron_due() { # cron-expression -> DUE
+  local mi h d mo rest y t
+  DUE=""
+  read -r mi h d mo rest <<<"$1"
+  case "$mi$h$d$mo" in '' | *[!0-9]*) return 0 ;; esac
+  read_clock
+  y=$(date +%Y)
+  for y in "$y" $((y + 1)); do
+    t=$(date -j -f '%Y-%m-%d %H:%M:%S' "$y-$mo-$d $h:$mi:00" +%s 2>/dev/null ||
+      date -d "$y-$mo-$d $h:$mi:00" +%s 2>/dev/null) || continue
+    [ "$t" -ge $((NOW - 90)) ] && DUE=$t && return 0
+  done
+  return 0
+}
+
+# The failure the last turn ended on: `failed` or `paused` (a rate or usage
+# limit, which Claude Code may resume by itself), or empty. A file rather than
+# the registry, because the idle nudge repaints the tab and must not lose it.
+read_failure() { # -> FAILURE
+  FAILURE=""
+  [ -e "$FAIL_MARKER" ] && read -r FAILURE 2>/dev/null <"$FAIL_MARKER"
+  return 0
 }
 
 # Background shells Claude Code left running are direct children of `claude`,
@@ -152,18 +240,20 @@ shells_running() { # owner-pid
 }
 
 # States that legitimately outlive the turn that painted them: an unanswered
-# permission prompt, blue for as long as a subagent token backs it, and magenta
-# for as long as a background shell runs. One predicate for both the foreign
-# sweep and our own tab, so the two cannot drift apart. Testing by name rather
-# than sweeping by name is deliberate — a state added later ages out like
-# `busy` instead of silently becoming un-healable. Blue and magenta are tied to
-# what backs them rather than exempt outright, so a lost SubagentStop or a
-# shell that ended with no hook to say so ages out instead of holding forever.
+# prompt, and every after-turn color for as long as what backs it is still
+# there. One predicate for both the foreign sweep and our own tab, so the two
+# cannot drift apart. Testing by name rather than sweeping by name is
+# deliberate — a state added later ages out like `busy` instead of silently
+# becoming un-healable. The backed states are tied to their evidence rather
+# than exempt outright, so a lost SubagentStop, a shell that ended with no hook
+# to say so, or a lost wake-up ages out instead of holding forever.
 outlives_turn() { # state tty-key owner-pid
   case "$1" in
     hold) return 0 ;;
     agents) agents_running "${STATE_DIR}/agent-$2-" ;;
     shells) shells_running "$3" ;;
+    failed | paused) [ -e "${STATE_DIR}/fail-$2" ] ;;
+    asleep) wake_pending "${STATE_DIR}/wake-$2-" ;;
     *) return 1 ;;
   esac
 }
@@ -171,7 +261,7 @@ outlives_turn() { # state tty-key owner-pid
 # Drop every tab's subagent tokens older than the TTL. Here rather than on the
 # agent events because a tab whose SubagentStop never came may never see another
 # agent event. The fork-free probe first, so a turn with no agents anywhere
-# costs no `find`.
+# costs no `find`. Wake-up tokens expire by their own contents instead.
 sweep_agents() {
   agents_running "$STATE_DIR/agent-" || return 0
   find "$STATE_DIR" -maxdepth 1 -name 'agent-*' -mmin "+$AGENT_TTL_MIN" -delete 2>/dev/null
@@ -215,17 +305,45 @@ paint() { # state r g b
 }
 paint_agents() { paint agents 0 150 200; }
 
-# What a tab shows once its turn is over: the work that outlived the turn, else
-# nothing. Blue outranks magenta because a shell may be a server that never
-# ends, and it would hide the subagent for good.
+# What a tab shows once its turn is over, most urgent first: a question still
+# waiting on you, a failure that needs you, then the work that outlived the
+# turn, then a wake-up still to come, else nothing. Blue outranks a pause
+# because subagents may still finish, and outranks magenta because a shell may
+# be a server that never ends, which would hide the subagent for good.
+#
+# A question asked after the turn — a background agent's, say — is kept as it
+# is: no hook says it was answered, so only the events that settle it (a new
+# prompt, a Stop, a StopFailure) repaint over it, and they drop the record first.
 paint_after_turn() {
-  if agents_running; then
+  local shown
+  read -r _ _ shown 2>/dev/null <"$TTY_RECORD" && [ "$shown" = hold ] && return 0
+  read_failure
+  if [ "$FAILURE" = failed ]; then
+    paint failed 190 20 20
+  elif agents_running; then
     paint_agents
+  elif [ "$FAILURE" = paused ]; then
+    paint paused 240 110 0
   elif shells_running "$owner"; then
-    paint shells 200 0 200
+    paint shells 255 90 220
+  elif wake_pending; then
+    paint asleep 110 115 140
   else
     reset_color
   fi
+}
+
+# Every way a turn ends: Stop, the idle nudge, StopFailure. Takes any other
+# records to drop, so they go in the same `rm`.
+end_turn() { # [file...]
+  rm -f "$OPEN_MARKER" "$@" 2>/dev/null
+  # Once a turn, off the hot path: the only chance a stranded tab in another
+  # terminal has of being cleaned up. First, so the stale-token sweep inside it
+  # also decides our own color below.
+  heal_registry
+  # Subagents and background shells outlive the turn that started them, so a
+  # finished turn with work still outstanding shows it rather than going dark.
+  paint_after_turn
 }
 
 # Busy means green normally, blue while subagents are outstanding.
@@ -245,32 +363,49 @@ paint_busy() {
   fi
 }
 
-read_payload() { # -> PAYLOAD
+read_payload() { # [max-bytes] -> PAYLOAD
   # Bounded read: an unclosed stdin would otherwise hang until Claude Code's
-  # hook timeout and stall the session, and bash reads byte-at-a-time.
+  # hook timeout and stall the session, and bash reads byte-at-a-time. 8 KiB
+  # reaches every field the hot events read; `schedule` asks for more, because
+  # its fields can follow a long prompt.
   PAYLOAD=""
-  [ -t 0 ] || IFS= read -r -d '' -t 2 -n 8192 PAYLOAD || true
+  [ -t 0 ] || IFS= read -r -d '' -t 2 -n "${1:-8192}" PAYLOAD || true
 }
 
+# A string value, or a bare literal such as `true`, which `schedule` needs.
+# Matching the key with its colon is what tells it from a string value that
+# happens to equal the key's name: inside a JSON string the quotes around such
+# a value are escaped, so `"stop":` cannot occur there.
 json_field() { # name -> FIELD, from $PAYLOAD, without forking
-  local key="\"$1\"" m=$PAYLOAD
+  local key="\"$1\":" m=$PAYLOAD
   FIELD=""
   case "$m" in
     *"$key"*) ;;
     *) return 0 ;;
   esac
   m=${m#*"$key"}
-  m=${m#*:}
-  m=${m#*\"}
-  FIELD=${m%%\"*}
+  m=${m#"${m%%[![:space:]]*}"}
+  case "$m" in
+    \"*)
+      m=${m#\"}
+      FIELD=${m%%\"*}
+      ;;
+    *)
+      m=${m%%[,\}]*}
+      FIELD=${m%"${m##*[![:space:]]}"}
+      ;;
+  esac
 }
 
 # ------------------------------------------------------- guards, cheapest first
 
 case "${1:-}" in
-  start | green | yellow | reset | session | agent-start | agent-stop) state="$1" ;;
+  start | green | yellow | reset | idle | failure | session | agent-start | agent-stop | \
+    compact-start | compact-end | schedule)
+    state="$1"
+    ;;
   *)
-    echo "usage: tab-state.sh {start|green|yellow|reset|session|agent-start|agent-stop}" >&2
+    echo "usage: tab-state.sh {start|green|yellow|reset|idle|failure|session|agent-start|agent-stop|compact-start|compact-end|schedule}" >&2
     # Exit 1, never 2: Claude Code reads hook exit 2 as "block this tool call".
     exit 1
     ;;
@@ -288,7 +423,9 @@ esac
 # Subagent tokens go too. This arm swallows the SubagentStop that would have
 # removed them, so leaving them behind means re-enabling paints blue for an
 # agent that finished while the feature was off. Open-turn markers go so that
-# every turn is closed on re-enable — the safe side.
+# every turn is closed on re-enable — the safe side. Failures and wake-ups go
+# for the same reason as subagents: the events that clear them are swallowed.
+# So everything goes, and no kind of record needs naming here.
 if [ -e "$DISABLE_FLAG" ]; then
   for f in "$STATE_DIR"/tty-*; do
     [ -e "$f" ] || continue
@@ -296,10 +433,10 @@ if [ -e "$DISABLE_FLAG" ]; then
     forget_tty "$d"
   done
   # The loop is a fork-free probe for leftovers no registry entry named; one
-  # `rm` then drains both classes, rather than one per file.
-  for f in "$STATE_DIR"/agent-* "$STATE_DIR"/open-*; do
+  # `rm` then drains them all, rather than one per file.
+  for f in "$STATE_DIR"/*; do
     [ -e "$f" ] || continue
-    rm -f "$STATE_DIR"/agent-* "$STATE_DIR"/open-* 2>/dev/null
+    rm -f "$STATE_DIR"/* 2>/dev/null
     break
   done
   exit 0
@@ -326,7 +463,9 @@ dev="${TAB_STATE_DEV:-}" # doubles as the initializer resolve_dev may not set
 key=${dev##*/}
 TTY_RECORD="${STATE_DIR}/tty-$key"
 OPEN_MARKER="${STATE_DIR}/open-$key"
+FAIL_MARKER="${STATE_DIR}/fail-$key"
 AGENT_GLOB="${STATE_DIR}/agent-$key-"
+WAKE_GLOB="${STATE_DIR}/wake-$key-"
 [ -d "$STATE_DIR" ] || mkdir -p "$STATE_DIR" 2>/dev/null
 
 # ------------------------------------------------------------------- dispatch
@@ -336,6 +475,10 @@ case "$state" in
     # UserPromptSubmit: the turn is open by definition. A flag, not a clock:
     # nothing reads its contents, so a bare redirect rather than a `date` fork.
     : >"$OPEN_MARKER" 2>/dev/null
+    # A new prompt answers a failure, and may be the firing of a one-shot
+    # wake-up. Both checks are fork-free unless there is something to drop.
+    [ -e "$FAIL_MARKER" ] && rm -f "$FAIL_MARKER" 2>/dev/null
+    drop_fired_wakeups
     paint_busy
     ;;
   green)
@@ -351,20 +494,40 @@ case "$state" in
     paint_busy
     ;;
   yellow)
-    # Wired to Notification's `permission_prompt` matcher, so the idle nudge
-    # never reaches this arm and no payload parsing is needed to tell them
-    # apart. `idle_prompt` is wired to `reset` instead.
+    # Wired to Notification's matchers for each kind of "needs you" — a
+    # permission prompt, an MCP server's input request, a background agent or
+    # teammate asking — so the idle nudge never reaches this arm and no payload
+    # parsing is needed to tell them apart. `idle_prompt` is wired to `idle`.
     paint hold 235 190 0
     ;;
   reset)
-    rm -f "$OPEN_MARKER" 2>/dev/null
-    # Once a turn, off the hot path: the only chance a stranded tab in another
-    # terminal has of being cleaned up. First, so the stale-token sweep inside
-    # it also decides our own color below.
-    heal_registry
-    # Subagents and background shells outlive the turn that started them, so a
-    # finished turn with work still outstanding shows it rather than going dark.
-    paint_after_turn
+    # Stop: a turn that ended well answers whatever came before it — a failure,
+    # a pause Claude Code resumed by itself, a question. Dropping the record
+    # tells paint_after_turn that a showing yellow is settled.
+    end_turn "$FAIL_MARKER" "$TTY_RECORD"
+    ;;
+  idle)
+    # The idle nudge, a minute after a turn. It ends the turn like Stop, but a
+    # failure is still unanswered, so it keeps showing.
+    end_turn
+    ;;
+  failure)
+    # StopFailure. Only for a turn that is open: Claude Code's own post-turn
+    # model work (titling, away summaries) runs with no turn around it, and its
+    # failure is not yours to answer.
+    turn_is_closed && exit 0
+    # A rate or usage limit is the one failure that may end by itself — Claude
+    # Code can resume when the limit resets — so it is a pause, not a failure.
+    # Matching on the payload rather than with hook matchers keeps this to one
+    # hook, and an error type added later lands on `failed`.
+    read_payload
+    json_field error
+    if [ "$FIELD" = rate_limit ]; then
+      echo paused >"$FAIL_MARKER" 2>/dev/null
+    else
+      echo failed >"$FAIL_MARKER" 2>/dev/null
+    fi
+    end_turn "$TTY_RECORD"
     ;;
   session)
     # A compact is not a boundary: `SessionStart` fires for it, but the turn
@@ -374,11 +537,68 @@ case "$state" in
     read_payload
     json_field source
     if [ "$FIELD" != compact ]; then
-      # Any other boundary is the one point where nothing can still be running.
-      rm -f "$AGENT_GLOB"* "$OPEN_MARKER" 2>/dev/null
-      reset_color
+      # Any other boundary is the one point where nothing can still be running,
+      # so every record this tab owns goes, as for a tab another session gave up.
+      # That includes wake-ups on /clear: whether Claude Code keeps cron jobs
+      # across it is not known, and a dark tab is the safe guess.
+      forget_tty "$dev"
     fi
     heal_registry
+    ;;
+  compact-start)
+    # PreCompact. Mid-turn the tab is already busy; between turns, a manual
+    # /compact is work with no turn around it, so an idle tab shows as busy
+    # until PostCompact. Only an idle one: every other color after a turn says
+    # more than green does. If PostCompact never comes — the compact was
+    # cancelled — the idle nudge ends it. No latch re-check: nothing here
+    # races a Stop.
+    turn_is_closed && [ ! -e "$TTY_RECORD" ] && paint busy 0 170 0
+    ;;
+  compact-end)
+    turn_is_closed && paint_after_turn
+    ;;
+  schedule)
+    # PostToolUse, matched to the scheduling tools only, so the payload read
+    # stays off the hot path. Nothing paints here: the turn is running, and
+    # its end paints the wake-up. Cron tokens are named by job id — CronCreate
+    # returns it, CronDelete takes it — so a delete drops exactly its own job.
+    read_payload 65536
+    json_field tool_name
+    tool=$FIELD
+    json_field id
+    job=${FIELD//[^A-Za-z0-9_-]/_}
+    case "$tool" in
+      ScheduleWakeup)
+        json_field stop
+        if [ "$FIELD" = true ]; then
+          rm -f "${WAKE_GLOB}loop" 2>/dev/null
+        else
+          json_field delaySeconds
+          case "$FIELD" in '' | *[!0-9]*) FIELD=3600 ;; esac
+          read_clock
+          due=$((NOW + FIELD))
+          echo "$due $((due + WAKE_GRACE_SEC))" >"${WAKE_GLOB}loop" 2>/dev/null
+        fi
+        ;;
+      CronCreate)
+        [ -n "$job" ] || exit 0
+        json_field recurring
+        read_clock
+        if [ "$FIELD" = false ]; then
+          json_field cron
+          cron_due "$FIELD"
+          # A schedule cron_due cannot place fires at its next match, which may
+          # be soon: count it due now, so the next prompt is the one to drop it.
+          due=${DUE:-$NOW}
+          echo "$due $((due + WAKE_GRACE_SEC))" >"${WAKE_GLOB}at-$job" 2>/dev/null
+        else
+          echo "0 $((NOW + CRON_LIFE_SEC))" >"${WAKE_GLOB}cron-$job" 2>/dev/null
+        fi
+        ;;
+      CronDelete)
+        [ -n "$job" ] && rm -f "${WAKE_GLOB}cron-$job" "${WAKE_GLOB}at-$job" 2>/dev/null
+        ;;
+    esac
     ;;
   agent-start)
     read_payload

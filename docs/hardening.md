@@ -52,6 +52,14 @@ behind them. 122 seconds after the last reset, against a 60-second expiry.
 
 ## Resolved
 
+### Background wake-ups running dark (was an edge case; settled 2026-10-11)
+
+The worry: when a background subagent or shell finishes after the turn, Claude
+Code wakes the main agent, and if that turn sent no `UserPromptSubmit` its tool
+hooks would see a closed latch and run dark. The probe now shows it does send
+one, with a `<task-notification>` prompt, so the latch opens like any other
+turn. The probe checks it on every run.
+
 ### The latch's 60s expiry (was item 1; fixed 2026-08-12)
 
 `STALE_AFTER` existed so a resumed or compacted session that never sends `start`
@@ -137,23 +145,29 @@ must treat a short read as "skip", which is the cheap and honest option.
 - **Yellow erased by other agents.** While one subagent waits on a permission
   prompt, tool hooks from the main thread or other subagents repaint green or
   blue. No payload field ties the prompt to its tool call.
-- **Background-agent wake-up runs dark.** When a background subagent finishes
-  after the turn ended, Claude Code wakes the main agent. If that wake-up sends
-  no `UserPromptSubmit`, its tool hooks see a closed latch and the tab stays
-  dark until `Stop`. The accepted false-dark trade-off, but now a common path
-  since subagents default to background (v2.1.198). Worth a probe case. A
-  background shell that ends wakes the agent the same way, so that turn runs
-  dark too once its first tool hook finds no shells left.
 - **Interrupt (Esc)** sends neither `Stop` nor `SessionEnd`. The tab stays
   green until the next prompt, the idle nudge, or the 30-minute foreign sweep.
+- **Yellow from a background agent can outlast its question.** When a
+  background agent or teammate asks after the turn ended, no hook fires when
+  you answer. The yellow is kept through the idle nudge, other subagents
+  finishing and a compact, and ends at the next prompt or `Stop` — the turn
+  that reports the agent's result. Until then it can show after you answered.
+- **Cron jobs and `/clear`.** Session boundaries drop every wake-up token. If
+  Claude Code keeps cron jobs across `/clear`, the tab goes dark while one is
+  still pending. Settling it needs an interactive `/clear`, which the probe
+  cannot run from `claude -p`.
+- **Auto-resume after a usage limit is unprobed.** Orange relies on the resumed
+  turn ending in a `Stop`. Turns that task notifications start do send
+  `UserPromptSubmit` (the probe checks it), but a quota resume has not been
+  seen; if it ends with no `Stop`, orange stays until your next prompt.
 
-### 4. Magenta depends on a Claude Code internal
+### 4. Magenta depends on a Claude Code internal (now guarded by the probe)
 
 `shells_running` in `tab-state.sh`
 
 It finds background shells by the `shell-snapshots` path on their command line.
 That is Claude Code's own detail, not a contract. If a release renames the dir
 or stops sourcing a snapshot, magenta silently never shows; it fails to the
-default color, so nothing gets stuck. A cheap guard: have `tests/probe-hooks.sh`
-start a background `sleep`, then check that `pgrep -P <claude> -f
-shell-snapshots` sees it.
+default color, so nothing gets stuck. `tests/probe-hooks.sh` now starts a
+background `sleep` and checks that `pgrep -P <claude> -f shell-snapshots` sees
+it, so a rename shows up the next time you probe an upgrade.

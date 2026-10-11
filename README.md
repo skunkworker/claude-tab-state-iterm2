@@ -4,23 +4,34 @@ Colors the **iTerm2 tab** to reflect what Claude Code is doing, so you can tell
 at a glance across multiple tabs whether a session is working, waiting on you,
 or idle.
 
+Highest first: when two are true at once, the tab shows the higher one. One
+exception is left: mid-turn, another agent's tool call repaints over a yellow
+(see `docs/hardening.md`).
+
 | Tab color | Meaning | Hook event |
 |-----------|---------|------------|
-| 🟢 green  | Claude is running | `UserPromptSubmit`, `PostToolUse` |
+| 🟡 yellow | Claude needs you: a permission prompt, an MCP server asking for input, or a background agent or teammate asking | `Notification` |
+| 🔴 red    | the turn died on an API error | `StopFailure` |
 | 🔵 blue   | waiting for subagents | `SubagentStart` / `SubagentStop` |
-| 🟡 yellow | Claude needs you (permission / question) | `Notification` (`permission_prompt`) |
-| 🟣 magenta | turn over, background shells still running | `Stop`, `StopFailure` |
-| default   | done / idle / session over | `Stop`, `StopFailure`, `SessionEnd`, `SessionStart` |
+| 🟢 green  | Claude is running, or a manual `/compact` on an idle tab is | `UserPromptSubmit`, `PostToolUse`, `PreCompact` |
+| 🟠 orange | stopped on a rate or usage limit; Claude Code may resume when it resets | `StopFailure` (`rate_limit`) |
+| 🟣 magenta | turn over, background shells still running | `Stop` |
+| 🩶 slate  | nothing running, but a wake-up is scheduled (`/loop`, a cron job) | `PostToolUse` on the scheduling tools |
+| default   | done / idle / session over | `Stop`, `SessionEnd`, `SessionStart` |
 
 Blue outranks green: while any subagent is outstanding the tab stays blue even
 as the parent keeps calling tools, and it stays blue after `Stop` — subagents
 outlive the turn that dispatched them, so a finished turn with work still
 running does not go dark.
 
-Magenta ranks last. It shows only once the turn is over and no subagent is
-left, while a shell Claude started in the background is still running. A
-background dev server counts, so a session that started one stays magenta until
-the server stops.
+Red, orange, magenta and slate show only once the turn is over. Red and orange
+stay until you send the next prompt; the idle nudge does not clear them. Orange
+also clears when a resumed turn ends well — but a plain rate-limit error that
+ran out of retries is not resumed, so if orange stays, prompt again. A
+background dev server counts as a running shell, so a session that started one
+stays magenta until the server stops. A yellow that appears after the turn — a
+background agent asking — stays until your next prompt or the next `Stop`,
+because no hook says you answered.
 
 ## Install
 
@@ -38,7 +49,8 @@ only the exact commands it generates, and leaves every other hook alone — so
 re-running it is safe and never stacks duplicates.
 
 The blue subagent state needs Claude Code **2.0.43 or newer** (`SubagentStart`
-and the `agent_id` hook field), and `StopFailure` needs **2.1.78**. `install.sh`
+and the `agent_id` hook field), `StopFailure` needs **2.1.78**, and the
+compaction pair needs **2.1.76** (`PostCompact`). `install.sh`
 checks `claude --version` and simply leaves an event unwired on anything older
 than it needs; every other color still works.
 
@@ -53,13 +65,22 @@ If you would rather wire it by hand, add this to `~/.claude/settings.json`:
 ```json
 "hooks": {
   "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh start" }] }],
-  "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh green" }] }],
+  "PostToolUse": [
+    { "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh green" }] },
+    { "matcher": "ScheduleWakeup|CronCreate|CronDelete", "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh schedule" }] }
+  ],
   "Notification": [
-    { "matcher": "permission_prompt", "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh yellow" }] },
-    { "matcher": "idle_prompt",       "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh reset" }] }
+    { "matcher": "permission_prompt",        "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh yellow" }] },
+    { "matcher": "elicitation_dialog",       "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh yellow" }] },
+    { "matcher": "elicitation_url_dialog",   "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh yellow" }] },
+    { "matcher": "agent_needs_input",        "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh yellow" }] },
+    { "matcher": "worker_permission_prompt", "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh yellow" }] },
+    { "matcher": "idle_prompt",              "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh idle" }] }
   ],
   "Stop":             [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh reset" }] }],
-  "StopFailure":      [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh reset" }] }],
+  "StopFailure":      [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh failure" }] }],
+  "PreCompact":       [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh compact-start" }] }],
+  "PostCompact":      [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh compact-end" }] }],
   "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh session" }] }],
   "SessionStart":     [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh session" }] }],
   "SubagentStart":    [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/tab-state.sh agent-start" }] }],
@@ -109,12 +130,46 @@ almost nothing per tool call.
   name of every process on the machine.
 
 - **Idle vs. real prompts.** The `Notification` event fires both for genuine
-  permission/question prompts **and** for the idle "Claude is waiting for your
-  input" nudge (~60s after a turn ends). Claude Code splits them with the
-  `permission_prompt` and `idle_prompt` matchers, so the two are wired to
-  different states and the script never has to look at the payload. An earlier
-  version string-matched the message text, which broke whenever a path happened
-  to contain the same wording and would have broken again on any rewording.
+  "needs you" moments **and** for the idle "Claude is waiting for your input"
+  nudge (~60s after a turn ends). Claude Code tags each with a type, so each
+  "needs you" type (`permission_prompt`, `elicitation_dialog`,
+  `elicitation_url_dialog`, `agent_needs_input`, `worker_permission_prompt`) is
+  wired to yellow, `idle_prompt` to `idle`, and the script never has to look at
+  the payload. An earlier version string-matched the message text, which broke
+  whenever a path happened to contain the same wording and would have broken
+  again on any rewording.
+
+- **Failed and paused turns.** A turn that dies on an API error sends
+  `StopFailure` instead of `Stop`, with an `error` field. `rate_limit` paints
+  orange, because Claude Code may resume by itself when the limit resets; every
+  other error, including types added later, paints red. A small file keeps the
+  failure, because the idle nudge repaints the tab a minute later and must not
+  erase it — which is why `idle_prompt` has its own `idle` state rather than
+  sharing `reset`. Your next prompt clears it, and so does a `Stop`: a turn
+  that ended well answers the failure before it. A `StopFailure` with no turn
+  open is ignored: it comes from Claude Code's own work after a turn (titling,
+  away summaries), and a good turn should not turn red for it.
+
+- **Scheduled wake-ups.** No hook fires when a `/loop` wake-up or a cron job
+  fires, so a second `PostToolUse` entry, matched to `ScheduleWakeup`,
+  `CronCreate` and `CronDelete` only, records what is pending: one token per
+  wake-up, holding
+  when it is due and when to stop believing it. A one-shot (a `/loop` wake-up,
+  a one-shot cron job) is dropped by the first prompt at or after its due time,
+  which is its own firing — a turn Claude Code starts by itself sends
+  `UserPromptSubmit` like a prompt you type — and expires 15 minutes after it
+  was due if that prompt never comes. A prompt you send earlier leaves it
+  alone. A recurring job lasts until `CronDelete` or its 7-day expiry. Cron
+  tokens are named by the job id that `CronCreate` returns and `CronDelete`
+  takes, so a delete drops exactly its own job. `/clear` and other session
+  boundaries drop them all: whether Claude Code keeps cron jobs across `/clear`
+  is not known, and a dark tab is the safe guess.
+
+- **Manual `/compact`.** Between turns it is work with no turn around it, so
+  on an idle tab `PreCompact` paints green and `PostCompact` puts the default
+  back. Any other color after a turn says more than green does, so it stays. A
+  compact that is cancelled sends no `PostCompact`; the idle nudge ends it.
+  Mid-turn compaction changes nothing.
 
 - **Counting subagents.** `SubagentStart` and `SubagentStop` both carry an
   `agent_id`, so each outstanding subagent gets its own token file and "any
@@ -185,12 +240,11 @@ almost nothing per tool call.
   others. Turn ends sweep as well, which only shortens the wait. An owner still
   alive keeps its tab unless its record has been `busy` and untouched for 30
   minutes, since every tool call rewrites it — waiting on you (yellow) is
-  exempt *by name*, blue while a subagent token still backs it, and magenta
-  while its owner still has a background shell, all being legitimately
-  long-lived. A state added later ages out rather than
-  silently becoming un-healable.
-  Clearing a tab that turns out to still be working costs nothing: its next
-  tool call repaints it.
+  exempt *by name*; blue, magenta, red, orange and slate are exempt only while
+  what backs them remains (a subagent token, a background shell, a failure
+  file, a wake-up token), all being legitimately long-lived. A state added
+  later ages out rather than silently becoming un-healable. Clearing a tab that
+  turns out to still be working costs nothing: its next tool call repaints it.
 
 - **Why not `PreToolUse`.** It used to be wired, on the theory that approving a
   three-minute test run otherwise leaves the tab yellow for the whole run. It
@@ -249,8 +303,11 @@ It starts a real Claude Code session in a temp dir with its own `--settings`
 checks that `SubagentStart`/`SubagentStop` fire, that both carry `agent_id`,
 that **the two ids agree** — tokens would leak and the tab would stick blue if
 they ever stopped — and that `tab-state.sh` still parses the payloads as
-actually shipped rather than as fixtured. Worth running when you upgrade
-Claude Code.
+actually shipped rather than as fixtured. It does the same for slate
+(`CronCreate` returns the job id `CronDelete` takes), for magenta (a background
+shell carries `shell-snapshots`), and for the turns Claude Code starts by
+itself (they send `UserPromptSubmit`). Worth running when you upgrade Claude
+Code.
 
 ## Files
 
