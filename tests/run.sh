@@ -95,10 +95,26 @@ t = time.time() - int(sys.argv[2])
 os.utime(sys.argv[1], (t, t))' "$1" "$2"
 }
 
+# Both agent events as Claude Code sends them: each names the session's
+# transcript, and the subagent's own lives beside it. Until a test writes that
+# one, the sweep has nothing to read and the TTL alone judges the token.
+SUBAGENTS="projects/p/sess/subagents"
 agent() { # agent-start|agent-stop id
-  printf '{"agent_id":"%s","agent_type":"general-purpose"}' "$2" | "$TAB_STATE" "$1"
+  printf '{"session_id":"sess","transcript_path":"%s","agent_id":"%s","agent_type":"general-purpose"}' \
+    "$SANDBOX/projects/p/sess.jsonl" "$2" | "$TAB_STATE" "$1"
 }
 agent_count() { find "$STATE_DIR" -name 'agent-*' | wc -l | tr -d ' '; }
+transcript_ends() { # id last-line(s)
+  mkdir -p "$SANDBOX/$SUBAGENTS"
+  printf '%s\n%s\n' '{"type":"user","message":{"role":"user","content":"go"}}' "$2" \
+    >"$SANDBOX/$SUBAGENTS/agent-$1.jsonl"
+}
+# Last lines trimmed from real subagent transcripts.
+API_ERROR='{"isSidechain":true,"agentId":"ag","type":"assistant","message":{"model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","content":[{"type":"text","text":"Prompt is too long"}]},"error":"invalid_request","isApiErrorMessage":true,"userType":"external"}'
+INTERRUPTED='{"isSidechain":true,"agentId":"ag","type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"userType":"external"}'
+WORKING='{"isSidechain":true,"agentId":"ag","type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}'
+# A tool result that quotes both endings, as a subagent reading this repo might.
+QUOTED='{"isSidechain":true,"agentId":"ag","type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"\"isApiErrorMessage\":true and \"content\":[{\"type\":\"text\",\"text\":\"[Request interrupted by user]\"}]"}]}}'
 
 # The one writer of the registry record format, so a change to it lands once.
 record() {              # tty owner state
@@ -469,6 +485,45 @@ if it "the subagent timeout is configurable"; then
   age "$STATE_DIR/agent-out-ag_live" 600
   TAB_STATE_AGENT_TTL_SEC=300 "$TAB_STATE" reset
   check "$CURRENT" "0" "$(agent_count)"
+fi
+
+if it "agent-start records where the subagent's transcript is"; then
+  "$TAB_STATE" start
+  agent agent-start ag_one
+  check "$CURRENT" "$SANDBOX/$SUBAGENTS/agent-ag_one.jsonl" "$(cat "$STATE_DIR/agent-out-ag_one")"
+fi
+
+# A subagent that dies on an API error or is interrupted sends no SubagentStop.
+# Seen live: one died on "Prompt is too long", and its tab stayed blue for the
+# rest of the 2h TTL. The others each look like an ending somewhere, but not
+# as the last line.
+judges_agent() { # name last-lines color tokens-left
+  it "$1" || return 0
+  "$TAB_STATE" start
+  agent agent-start ag
+  [ -n "$2" ] && transcript_ends ag "$2"
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (color)" "$3" "$(out)"
+  check "$CURRENT (tokens)" "$4" "$(agent_count)"
+}
+judges_agent "a subagent that died on an API error is swept at the turn end" "$API_ERROR" "$DEFAULT" 0
+judges_agent "an interrupted subagent is swept at the turn end" "$INTERRUPTED" "$DEFAULT" 0
+judges_agent "a subagent that worked on after an API error is kept" "$API_ERROR"$'\n'"$WORKING" "$BLUE" 1
+judges_agent "a tool result quoting an ending does not end the subagent" "$QUOTED" "$BLUE" 1
+judges_agent "a subagent whose transcript is not written yet is kept" "" "$BLUE" 1
+
+if it "a dead subagent leaves blue to the ones still working"; then
+  "$TAB_STATE" start
+  agent agent-start ag_dead
+  agent agent-start ag_live
+  transcript_ends ag_dead "$API_ERROR"
+  transcript_ends ag_live "$WORKING"
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (still blue)" "$BLUE" "$(out)"
+  check "$CURRENT (dead one gone)" "absent" "$(exists "$STATE_DIR/agent-out-ag_dead")"
+  check "$CURRENT (live one kept)" "present" "$(exists "$STATE_DIR/agent-out-ag_live")"
 fi
 
 if it "an agent_id cannot escape the state directory"; then
@@ -1167,6 +1222,16 @@ if it "a blue tab with no subagent left is cleared"; then
   "$TAB_STATE" reset
   check "$CURRENT (cleared)" "$DEFAULT" "$(cat "$other")"
   check "$CURRENT (token swept)" "absent" "$(exists "$STATE_DIR/agent-other-ag_stuck")"
+fi
+
+if it "a blue tab whose subagent died is cleared before the TTL"; then
+  other=$(strand $$ agents)
+  age "$STATE_DIR/tty-other" 3600
+  transcript_ends ag_dead "$API_ERROR"
+  echo "$SANDBOX/$SUBAGENTS/agent-ag_dead.jsonl" >"$STATE_DIR/agent-other-ag_dead"
+  "$TAB_STATE" reset
+  check "$CURRENT (cleared)" "$DEFAULT" "$(cat "$other")"
+  check "$CURRENT (token swept)" "absent" "$(exists "$STATE_DIR/agent-other-ag_dead")"
 fi
 
 if it "a quiet magenta tab is spared while its shells run"; then
