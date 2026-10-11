@@ -26,6 +26,7 @@ BEL=$'\007'
 GREEN="${ESC}]6;1;bg;red;brightness;0${BEL}${ESC}]6;1;bg;green;brightness;170${BEL}${ESC}]6;1;bg;blue;brightness;0${BEL}"
 YELLOW="${ESC}]6;1;bg;red;brightness;235${BEL}${ESC}]6;1;bg;green;brightness;190${BEL}${ESC}]6;1;bg;blue;brightness;0${BEL}"
 BLUE="${ESC}]6;1;bg;red;brightness;0${BEL}${ESC}]6;1;bg;green;brightness;150${BEL}${ESC}]6;1;bg;blue;brightness;200${BEL}"
+MAGENTA="${ESC}]6;1;bg;red;brightness;200${BEL}${ESC}]6;1;bg;green;brightness;0${BEL}${ESC}]6;1;bg;blue;brightness;200${BEL}"
 DEFAULT="${ESC}]6;1;bg;*;default${BEL}"
 
 setup() {
@@ -45,10 +46,39 @@ setup() {
 }
 
 teardown() {
+  end_shell
   [ -n "${SANDBOX:-}" ] && rm -rf "$SANDBOX"
   SANDBOX=""
 }
+
+# A stand-in for a background shell Claude Code left running: a child of this
+# harness, which is the script's owner under TAB_STATE_DEV, with the snapshot
+# dir on its command line as every real one has. The loop stops bash from
+# exec'ing into `sleep`, which would drop the marker from the command line.
+spawn_shell() {
+  bash -c 'while :; do sleep 1; done' shell-snapshots &
+  SHELL_PID=$!
+  # Until the child execs, it still carries our command line.
+  eventually pgrep -P $$ -f shell-snapshots >/dev/null 2>&1
+}
+end_shell() {
+  [ -n "${SHELL_PID:-}" ] || return 0
+  kill "$SHELL_PID" 2>/dev/null
+  wait "$SHELL_PID" 2>/dev/null
+  SHELL_PID=""
+}
 trap teardown EXIT
+
+# Retries a command for up to 2s; fails if it never succeeds.
+eventually() {
+  local tries=0
+  until "$@"; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 40 ] || return 1
+    sleep 0.05
+  done
+}
+gone() { ! kill -0 "$1" 2>/dev/null; }
 
 out() { cat "$TAB_STATE_DEV"; }
 clear_out() { : >"$TAB_STATE_DEV"; }
@@ -224,7 +254,10 @@ if it "start reopens the turn so the next green paints"; then
   check "$CURRENT" "$GREEN" "$(out)"
 fi
 
-if it "a Stop landing mid-paint does not strand the tab green"; then
+# Leaves in $SANDBOX/drain everything the tab received. Not a command
+# substitution: the painter must stay a child of this harness, which is its
+# owner, or a test's stand-in shell would not count as one of its shells.
+green_racing_stop() {
   # The latch is a test followed by a paint, so only a real interleaving
   # exercises the re-check that follows it. A fifo gives us one: the paint
   # blocks on open until something reads, so the Stop can land mid-brushstroke.
@@ -246,10 +279,23 @@ if it "a Stop landing mid-paint does not strand the tab green"; then
   reader=$!
   wait "$painter"
   # Regression case: only green was written, so the second reader is still
-  # blocked on its open. Pair with it, so a failure fails instead of hanging.
-  kill -0 "$reader" 2>/dev/null && : >"$SANDBOX/fifo"
+  # blocked on its open. Release it, so a failure fails instead of hanging. A
+  # blocking write-open here races a reader that is just finishing, so give it
+  # time to exit, then use read-write, which never blocks.
+  eventually gone "$reader" || : <>"$SANDBOX/fifo"
   wait "$reader" 2>/dev/null
+}
+
+if it "a Stop landing mid-paint does not strand the tab green"; then
+  green_racing_stop
   check "$CURRENT" "$GREEN$DEFAULT" "$(cat "$SANDBOX/drain")"
+fi
+
+if it "a Stop landing mid-paint keeps the tab magenta while shells run"; then
+  # The re-check repaints what Stop painted, which is not always the default.
+  spawn_shell
+  green_racing_stop
+  check "$CURRENT" "$GREEN$MAGENTA" "$(cat "$SANDBOX/drain")"
 fi
 
 if it "a green after the turn closed clears a tab left painted"; then
@@ -427,6 +473,81 @@ if it "an agent_id cannot escape the state directory"; then
   agent agent-start '../../../../tmp/pwned'
   check "$CURRENT" "absent" "$(exists /tmp/pwned)"
   check "$CURRENT (contained)" "1" "$(agent_count)"
+fi
+
+# ------------------------------------------------------- background shell colour
+
+if it "a finished turn turns magenta while shells run"; then
+  "$TAB_STATE" start
+  spawn_shell
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (painted)" "$MAGENTA" "$(out)"
+  check "$CURRENT (registered)" "shells" "$(shown)"
+fi
+
+if it "a running turn stays green while shells run"; then
+  spawn_shell
+  "$TAB_STATE" start
+  check "$CURRENT (start)" "$GREEN" "$(out)"
+  clear_out
+  "$TAB_STATE" green
+  check "$CURRENT (green)" "$GREEN" "$(out)"
+fi
+
+if it "blue outranks magenta"; then
+  "$TAB_STATE" start
+  agent agent-start ag_one
+  spawn_shell
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (blue first)" "$BLUE" "$(out)"
+  clear_out
+  agent agent-stop ag_one
+  check "$CURRENT (then magenta)" "$MAGENTA" "$(out)"
+fi
+
+if it "the idle nudge keeps the tab magenta"; then
+  "$TAB_STATE" start
+  spawn_shell
+  "$TAB_STATE" reset
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT" "$MAGENTA" "$(out)"
+fi
+
+if it "a green after the turn closed spares magenta while shells run"; then
+  # Claude Code's own post-turn work, as in the latch tests above.
+  "$TAB_STATE" start
+  spawn_shell
+  "$TAB_STATE" reset
+  clear_out
+  "$TAB_STATE" green
+  check "$CURRENT (untouched)" "" "$(out)"
+  check "$CURRENT (still registered)" "present" "$(exists "$REGISTRY")"
+fi
+
+if it "a green after the turn closed clears magenta once the shells end"; then
+  # No hook fires when a shell ends. Claude Code wakes up to report it, and the
+  # tool hooks of that turn arrive with the turn still closed.
+  "$TAB_STATE" start
+  spawn_shell
+  "$TAB_STATE" reset
+  end_shell
+  clear_out
+  "$TAB_STATE" green
+  check "$CURRENT (cleared)" "$DEFAULT" "$(out)"
+  check "$CURRENT (deregistered)" "absent" "$(exists "$REGISTRY")"
+fi
+
+if it "a session boundary does not paint magenta"; then
+  # SessionEnd's shells die with the session, and no hook would come back to
+  # clear a tab painted on the way out.
+  "$TAB_STATE" start
+  spawn_shell
+  clear_out
+  "$TAB_STATE" session </dev/null
+  check "$CURRENT" "$DEFAULT" "$(out)"
 fi
 
 # --------------------------------------------------------------- disable flag
@@ -651,6 +772,24 @@ if it "a blue tab with no subagent left is cleared"; then
   "$TAB_STATE" reset
   check "$CURRENT (cleared)" "$DEFAULT" "$(cat "$other")"
   check "$CURRENT (token swept)" "absent" "$(exists "$STATE_DIR/agent-other-ag_stuck")"
+fi
+
+if it "a quiet magenta tab is spared while its shells run"; then
+  # The harness owns the stand-in shell, so it stands in for the owner too.
+  spawn_shell
+  other=$(strand $$ shells)
+  age "$STATE_DIR/tty-other" 3600
+  "$TAB_STATE" reset
+  check "$CURRENT" "" "$(cat "$other")"
+fi
+
+if it "a magenta tab with no shell left ages out"; then
+  # Like blue with no token: once nothing backs it, it ages out like busy.
+  other=$(strand $$ shells)
+  age "$STATE_DIR/tty-other" 3600
+  "$TAB_STATE" reset
+  check "$CURRENT (cleared)" "$DEFAULT" "$(cat "$other")"
+  check "$CURRENT (deregistered)" "absent" "$(exists "$STATE_DIR/tty-other")"
 fi
 
 if it "an unrecognized state ages out instead of being spared forever"; then
