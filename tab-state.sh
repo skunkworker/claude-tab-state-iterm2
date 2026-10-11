@@ -367,9 +367,10 @@ if [ -e "$DISABLE_FLAG" ]; then
   done
   # The loop is a fork-free probe for leftovers no registry entry named; one
   # `rm` then drains every class, rather than one per file.
-  for f in "$STATE_DIR"/agent-* "$STATE_DIR"/open-* "$STATE_DIR"/fail-* "$STATE_DIR"/wake-*; do
+  set -- "$STATE_DIR"/agent-* "$STATE_DIR"/open-* "$STATE_DIR"/fail-* "$STATE_DIR"/wake-*
+  for f; do
     [ -e "$f" ] || continue
-    rm -f "$STATE_DIR"/agent-* "$STATE_DIR"/open-* "$STATE_DIR"/fail-* "$STATE_DIR"/wake-* 2>/dev/null
+    rm -f "$@" 2>/dev/null
     break
   done
   exit 0
@@ -466,9 +467,9 @@ case "$state" in
     read_payload
     json_field source
     if [ "$FIELD" != compact ]; then
-      # Any other boundary is the one point where nothing can still be running.
-      rm -f "$AGENT_GLOB"* "$WAKE_GLOB"* "$OPEN_MARKER" "$FAIL_MARKER" 2>/dev/null
-      reset_color
+      # Any other boundary is the one point where nothing can still be running,
+      # so every record this tab owns goes, as for a tab another session gave up.
+      forget_tty "$dev"
     fi
     heal_registry
     ;;
