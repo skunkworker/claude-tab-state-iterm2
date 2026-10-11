@@ -146,6 +146,19 @@ must treat a short read as "skip", which is the cheap and honest option.
   dark too once its first tool hook finds no shells left.
 - **Interrupt (Esc)** sends neither `Stop` nor `SessionEnd`. The tab stays
   green until the next prompt, the idle nudge, or the 30-minute foreign sweep.
+- **Yellow from a background agent can outlast its question.** When a
+  background agent or teammate asks after the turn ended, no hook fires when
+  you answer, and `hold` outlives the turn. The tab stays yellow until the next
+  prompt, the idle nudge, or that agent's `SubagentStop`.
+- **Wake-up and auto-resume turns may not send `UserPromptSubmit`.** Slate's
+  one-shot token and orange both rely on it, or on the `Stop` behind it. A
+  background task's notice in a live session did arrive with a
+  `UserPromptSubmit`, which suggests the same path; a probe case would settle
+  it. If not, a `/loop` that ends without `stop` stays slate until the next
+  prompt or the 7-day sweep.
+- **`CronDelete` does not say which job.** It clears every recurring-job token
+  for that tab, so one of two jobs deleted leaves the tab dark while the other
+  is still pending. A dark tab is the safe side of the guess.
 
 ### 4. Magenta depends on a Claude Code internal
 

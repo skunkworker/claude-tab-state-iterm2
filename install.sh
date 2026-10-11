@@ -90,16 +90,24 @@ path, mode, dry, version = sys.argv[1], sys.argv[2], sys.argv[3] == "1", sys.arg
 # link itself for a regular file and detach it from whatever it pointed at.
 path = os.path.realpath(path)
 
-# (event, matcher, state). The two Notification matchers split the real
-# permission prompt from the idle nudge, which the script would otherwise have
-# to tell apart by string-matching the payload.
+# (event, matcher, state). The Notification matchers split each kind of
+# "needs you" from the idle nudge, which the script would otherwise have to
+# tell apart by string-matching the payload. The scheduling tools get their own
+# PostToolUse entry so that only they pay for reading the payload.
 SPEC = [
     ("UserPromptSubmit", None, "start"),
     ("PostToolUse", None, "green"),
+    ("PostToolUse", "ScheduleWakeup|CronCreate|CronDelete", "schedule"),
     ("Notification", "permission_prompt", "yellow"),
-    ("Notification", "idle_prompt", "reset"),
+    ("Notification", "elicitation_dialog", "yellow"),
+    ("Notification", "elicitation_url_dialog", "yellow"),
+    ("Notification", "agent_needs_input", "yellow"),
+    ("Notification", "worker_permission_prompt", "yellow"),
+    ("Notification", "idle_prompt", "idle"),
     ("Stop", None, "reset"),
-    ("StopFailure", None, "reset"),
+    ("StopFailure", None, "failure"),
+    ("PreCompact", None, "compact-start"),
+    ("PostCompact", None, "compact-end"),
     ("SessionEnd", None, "session"),
     ("SessionStart", None, "session"),
     ("SubagentStart", None, "agent-start"),
@@ -115,11 +123,14 @@ RETIRED = ["PreToolUse"]
 # Events newer than the oldest Claude Code this supports. What an older Claude
 # Code does with an unknown hook event is untested here, so do not hand it one.
 # StopFailure is what an API error sends instead of Stop; without it a rate
-# limit leaves the tab green.
+# limit leaves the tab green. PreCompact is older, but it shares PostCompact's
+# gate: one without the other would leave a manual /compact painted busy.
 MIN_VERSION = {
     "SubagentStart": (2, 0, 43),
     "SubagentStop": (2, 0, 43),
     "StopFailure": (2, 1, 78),
+    "PreCompact": (2, 1, 76),
+    "PostCompact": (2, 1, 76),
 }
 
 # An unknown version counts as new enough: someone installing this without
@@ -132,7 +143,8 @@ installed = tuple(int(g) for g in m.groups()) if m else None
 # that merely mentions the path, and delete it on uninstall.
 OWNED = re.compile(
     r"^bash ~/\.claude/tab-state\.sh "
-    r"(?:start|green|yellow|reset|session|agent-start|agent-stop)$"
+    r"(?:start|green|yellow|reset|idle|failure|session|agent-start|agent-stop"
+    r"|compact-start|compact-end|schedule)$"
 )
 
 def note(msg):
@@ -152,7 +164,7 @@ hooks = data.get("hooks") or {}
 
 # Strip our previous entries so re-running never stacks duplicates. On install
 # only touch events we are about to rewire: an event we do not ship (someone's
-# hand-wired PreCompact, say) is theirs to keep. Uninstall clears all of them.
+# hand-wired TeammateIdle, say) is theirs to keep. Uninstall clears all of them.
 scope = [e for e, _, _ in SPEC] + RETIRED if mode == "install" else list(hooks)
 for event in scope:
     groups = []

@@ -18,6 +18,21 @@ version, so the date something landed is the useful thing to know.
   tab magenta until it stops; that is deliberate.
 - Magenta follows blue's rule in the foreign sweep: exempt while a shell backs
   it, then aged out like `busy`.
+- **Red: the turn died on an API error.** `StopFailure` used to reset the tab,
+  so a failed turn looked the same as a finished one. It now reads the payload's
+  `error` field and paints red, and the color stays until your next prompt.
+- **Orange: paused on your usage limit.** The `rate_limit` error gets its own
+  color, because Claude Code resumes the task by itself when the limit resets.
+  The `Stop` of that resumed turn clears it.
+- **Slate: a wake-up is scheduled.** A `/loop` wake-up or a cron job means the
+  session will act again with nobody prompting it. A `PostToolUse` entry
+  matched to `ScheduleWakeup`, `CronCreate` and `CronDelete` records it.
+- **More kinds of "needs you" turn the tab yellow:** an MCP server asking for
+  input (`elicitation_dialog`, `elicitation_url_dialog`), and a background
+  agent or teammate asking (`agent_needs_input`, `worker_permission_prompt`).
+  Before, the tab stayed green while Claude waited for you.
+- **A manual `/compact` between turns shows green** until it finishes
+  (`PreCompact` / `PostCompact`, gated to Claude Code 2.1.76).
 
 ### Changed
 
@@ -25,6 +40,14 @@ version, so the date something landed is the useful thing to know.
   painted, not always the default, so a `Stop` landing mid-paint keeps a
   magenta tab magenta. `reset` and `agent-stop` share the same "what is left
   after the turn" choice, `paint_after_turn`.
+- **Magenta is pinker: `255 90 220`, was `200 0 200`.** The old shade and blue
+  were hard to tell apart with deuteranopia, the most common color-blindness
+  (CIE76 ΔE 7.5 after simulation). The weakest pair in the full set is now
+  green and orange under protanopia, at 11.5.
+- `idle_prompt` is wired to a new `idle` state instead of `reset`, so the idle
+  nudge cannot erase a failure. Re-run `install.sh` to pick up the new wiring.
+- `json_field` also reads bare values such as `true`, which the scheduling
+  tools need.
 
 ### Fixed
 
