@@ -4,15 +4,17 @@ Colors the **iTerm2 tab** to reflect what Claude Code is doing, so you can tell
 at a glance across multiple tabs whether a session is working, waiting on you,
 or idle.
 
-Highest first: when two are true at once, the higher one paints the tab.
+Highest first: when two are true at once, the tab shows the higher one. One
+exception is left: mid-turn, another agent's tool call repaints over a yellow
+(see `docs/hardening.md`).
 
 | Tab color | Meaning | Hook event |
 |-----------|---------|------------|
 | 🟡 yellow | Claude needs you: a permission prompt, an MCP server asking for input, or a background agent or teammate asking | `Notification` |
 | 🔴 red    | the turn died on an API error | `StopFailure` |
 | 🔵 blue   | waiting for subagents | `SubagentStart` / `SubagentStop` |
-| 🟢 green  | Claude is running, or a manual `/compact` is | `UserPromptSubmit`, `PostToolUse`, `PreCompact` |
-| 🟠 orange | paused on your usage limit; Claude Code resumes when it resets | `StopFailure` (`rate_limit`) |
+| 🟢 green  | Claude is running, or a manual `/compact` on an idle tab is | `UserPromptSubmit`, `PostToolUse`, `PreCompact` |
+| 🟠 orange | stopped on a rate or usage limit; Claude Code may resume when it resets | `StopFailure` (`rate_limit`) |
 | 🟣 magenta | turn over, background shells still running | `Stop` |
 | 🩶 slate  | nothing running, but a wake-up is scheduled (`/loop`, a cron job) | `PostToolUse` on the scheduling tools |
 | default   | done / idle / session over | `Stop`, `SessionEnd`, `SessionStart` |
@@ -22,11 +24,14 @@ as the parent keeps calling tools, and it stays blue after `Stop` — subagents
 outlive the turn that dispatched them, so a finished turn with work still
 running does not go dark.
 
-Red, orange, magenta and slate show only once the turn is over. Red stays until
-you send the next prompt; the idle nudge does not clear it. Orange also clears
-on its own when the resumed turn ends. A background dev server counts as a
-running shell, so a session that started one stays magenta until the server
-stops.
+Red, orange, magenta and slate show only once the turn is over. Red and orange
+stay until you send the next prompt; the idle nudge does not clear them. Orange
+also clears when a resumed turn ends well — but a plain rate-limit error that
+ran out of retries is not resumed, so if orange stays, prompt again. A
+background dev server counts as a running shell, so a session that started one
+stays magenta until the server stops. A yellow that appears after the turn — a
+background agent asking — stays until your next prompt or the next `Stop`,
+because no hook says you answered.
 
 ## Install
 
@@ -136,24 +141,34 @@ almost nothing per tool call.
 
 - **Failed and paused turns.** A turn that dies on an API error sends
   `StopFailure` instead of `Stop`, with an `error` field. `rate_limit` paints
-  orange, because Claude Code resumes by itself when the limit resets; every
+  orange, because Claude Code may resume by itself when the limit resets; every
   other error, including types added later, paints red. A small file keeps the
   failure, because the idle nudge repaints the tab a minute later and must not
   erase it — which is why `idle_prompt` has its own `idle` state rather than
   sharing `reset`. Your next prompt clears it, and so does a `Stop`: a turn
-  that ended well answers the failure before it.
+  that ended well answers the failure before it. A `StopFailure` with no turn
+  open is ignored: it comes from Claude Code's own work after a turn (titling,
+  away summaries), and a good turn should not turn red for it.
 
 - **Scheduled wake-ups.** No hook fires when a `/loop` wake-up or a cron job
   fires, so a second `PostToolUse` entry, matched to `ScheduleWakeup`,
-  `CronCreate` and `CronDelete` only, records what is pending. A wake-up that
-  fires once is cleared by the next prompt, which is that wake-up's own turn or
-  comes before it; a loop that goes on schedules the next one in that same
-  turn. A recurring cron job lasts until `CronDelete` or its 7-day expiry.
-  `CronDelete` does not say which job it removed, so it clears all of that
-  tab's recurring jobs: a dark tab is the safe guess.
+  `CronCreate` and `CronDelete` only, records what is pending: one token per
+  wake-up, holding
+  when it is due and when to stop believing it. A one-shot (a `/loop` wake-up,
+  a one-shot cron job) is dropped by the first prompt at or after its due time,
+  which is its own firing — a turn Claude Code starts by itself sends
+  `UserPromptSubmit` like a prompt you type — and expires 15 minutes after it
+  was due if that prompt never comes. A prompt you send earlier leaves it
+  alone. A recurring job lasts until `CronDelete` or its 7-day expiry. Cron
+  tokens are named by the job id that `CronCreate` returns and `CronDelete`
+  takes, so a delete drops exactly its own job. `/clear` and other session
+  boundaries drop them all: whether Claude Code keeps cron jobs across `/clear`
+  is not known, and a dark tab is the safe guess.
 
 - **Manual `/compact`.** Between turns it is work with no turn around it, so
-  `PreCompact` paints green and `PostCompact` puts back the color from before.
+  on an idle tab `PreCompact` paints green and `PostCompact` puts the default
+  back. Any other color after a turn says more than green does, so it stays. A
+  compact that is cancelled sends no `PostCompact`; the idle nudge ends it.
   Mid-turn compaction changes nothing.
 
 - **Counting subagents.** `SubagentStart` and `SubagentStop` both carry an
@@ -288,8 +303,11 @@ It starts a real Claude Code session in a temp dir with its own `--settings`
 checks that `SubagentStart`/`SubagentStop` fire, that both carry `agent_id`,
 that **the two ids agree** — tokens would leak and the tab would stick blue if
 they ever stopped — and that `tab-state.sh` still parses the payloads as
-actually shipped rather than as fixtured. Worth running when you upgrade
-Claude Code.
+actually shipped rather than as fixtured. It does the same for slate
+(`CronCreate` returns the job id `CronDelete` takes), for magenta (a background
+shell carries `shell-snapshots`), and for the turns Claude Code starts by
+itself (they send `UserPromptSubmit`). Worth running when you upgrade Claude
+Code.
 
 ## Files
 

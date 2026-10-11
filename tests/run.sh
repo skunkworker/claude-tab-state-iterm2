@@ -176,9 +176,9 @@ fi
 
 # ------------------------------------------------------------ notification path
 
-# The permission_prompt / idle_prompt matchers do the splitting now, so yellow
-# paints unconditionally and reads no payload at all. The idle nudge is wired
-# to `reset` and is covered by the reset tests.
+# The Notification matchers do the splitting now, so yellow paints
+# unconditionally and reads no payload at all. The idle nudge is wired to
+# `idle`, covered with the after-turn colors below.
 if it "yellow paints regardless of the payload"; then
   echo '{"message":"Claude is waiting for your input"}' | "$TAB_STATE" yellow
   check "$CURRENT (ignores stdin)" "$YELLOW" "$(out)"
@@ -515,7 +515,7 @@ if it "the idle nudge keeps the tab magenta"; then
   spawn_shell
   "$TAB_STATE" reset
   clear_out
-  "$TAB_STATE" reset
+  "$TAB_STATE" idle
   check "$CURRENT" "$MAGENTA" "$(out)"
 fi
 
@@ -645,6 +645,17 @@ if it "orange outranks magenta"; then
   check "$CURRENT" "$ORANGE" "$(out)"
 fi
 
+if it "a failure after the turn closed is not yours to answer"; then
+  # Claude Code's own post-turn model work (titling, away summaries) runs with
+  # no turn around it; a StopFailure from it must not paint a good turn red.
+  "$TAB_STATE" start
+  "$TAB_STATE" reset
+  clear_out
+  fail_with overloaded
+  check "$CURRENT (untouched)" "" "$(out)"
+  check "$CURRENT (no marker)" "absent" "$(exists "$STATE_DIR/fail-out")"
+fi
+
 if it "a session boundary forgets a failure"; then
   "$TAB_STATE" start
   fail_with overloaded
@@ -654,14 +665,70 @@ if it "a session boundary forgets a failure"; then
   check "$CURRENT" "$DEFAULT" "$(out)"
 fi
 
+# ------------------------------------------------------- questions after a turn
+
+# A background agent or teammate can ask after the turn ended. No hook says it
+# was answered, so only the events that settle it may paint over the yellow.
+
+if it "a question after the turn survives the idle nudge"; then
+  "$TAB_STATE" start
+  agent agent-start ag_one
+  "$TAB_STATE" reset
+  "$TAB_STATE" yellow
+  clear_out
+  "$TAB_STATE" idle
+  check "$CURRENT (untouched)" "" "$(out)"
+  check "$CURRENT (still yellow)" "hold" "$(shown)"
+fi
+
+if it "a question after the turn survives another subagent finishing"; then
+  "$TAB_STATE" start
+  agent agent-start ag_one
+  agent agent-start ag_two
+  "$TAB_STATE" reset
+  "$TAB_STATE" yellow
+  clear_out
+  agent agent-stop ag_two
+  check "$CURRENT (untouched)" "" "$(out)"
+  check "$CURRENT (still yellow)" "hold" "$(shown)"
+fi
+
+if it "a question after the turn survives a compact"; then
+  "$TAB_STATE" start
+  "$TAB_STATE" reset
+  "$TAB_STATE" yellow
+  clear_out
+  "$TAB_STATE" compact-start
+  "$TAB_STATE" compact-end
+  check "$CURRENT" "" "$(out)"
+fi
+
+if it "a Stop settles a question"; then
+  "$TAB_STATE" start
+  "$TAB_STATE" reset
+  "$TAB_STATE" yellow
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT" "$DEFAULT" "$(out)"
+fi
+
 # ------------------------------------------------------- scheduled wake-ups
 
-schedule() { # tool input-json
-  printf '{"hook_event_name":"PostToolUse","tool_name":"%s","tool_input":%s,"tool_response":"ok"}' \
-    "$1" "$2" | "$TAB_STATE" schedule
+schedule() { # tool input-json [response-json]
+  printf '{"hook_event_name":"PostToolUse","tool_name":"%s","tool_input":%s,"tool_response":%s}' \
+    "$1" "$2" "${3:-\"ok\"}" | "$TAB_STATE" schedule
 }
+job() { printf '{"id":"%s","humanSchedule":"x","recurring":%s,"durable":false}' "$1" "${2:-true}"; }
 WAKEUP='{"delaySeconds":600,"prompt":"check the deploy","reason":"waiting on CI"}'
 CRON='{"cron":"7 * * * *","prompt":"sweep PRs"}'
+ONESHOT='{"cron":"17 3 1 1 *","prompt":"new-year check","recurring":false}'
+
+wake_token() { cat "$STATE_DIR/wake-out-$1" 2>/dev/null; }
+set_token() { # name due-offset expires-offset, both seconds from now
+  local now
+  now=$(date +%s)
+  echo "$((now + $2)) $((now + $3))" >"$STATE_DIR/wake-out-$1"
+}
 
 if it "a pending wake-up turns a finished turn slate"; then
   "$TAB_STATE" start
@@ -682,19 +749,9 @@ if it "stopping the loop clears the wake-up"; then
   check "$CURRENT" "$DEFAULT" "$(out)"
 fi
 
-if it "the next prompt clears a one-shot wake-up"; then
+if it "a prompt before a wake-up is due keeps it"; then
   "$TAB_STATE" start
   schedule ScheduleWakeup "$WAKEUP"
-  "$TAB_STATE" reset
-  "$TAB_STATE" start
-  clear_out
-  "$TAB_STATE" reset
-  check "$CURRENT" "$DEFAULT" "$(out)"
-fi
-
-if it "a recurring cron job outlives the next prompt"; then
-  "$TAB_STATE" start
-  schedule CronCreate "$CRON"
   "$TAB_STATE" reset
   "$TAB_STATE" start
   clear_out
@@ -702,48 +759,128 @@ if it "a recurring cron job outlives the next prompt"; then
   check "$CURRENT" "$SLATE" "$(out)"
 fi
 
-if it "a one-shot cron job ends like a wake-up"; then
+if it "the prompt a due wake-up fires drops it"; then
   "$TAB_STATE" start
-  schedule CronCreate '{"cron":"57 8 12 10 *","prompt":"run the smoke test","recurring":false}'
+  schedule ScheduleWakeup "$WAKEUP"
   "$TAB_STATE" reset
-  check "$CURRENT (slate)" "$SLATE" "$(out)"
+  set_token loop -60 840 # it fired a minute ago
   "$TAB_STATE" start
-  clear_out
-  "$TAB_STATE" reset
-  check "$CURRENT (gone after the next prompt)" "$DEFAULT" "$(out)"
-fi
-
-if it "CronDelete clears a recurring cron job"; then
-  "$TAB_STATE" start
-  schedule CronCreate "$CRON"
-  schedule CronDelete '{"id":"job_1"}'
   clear_out
   "$TAB_STATE" reset
   check "$CURRENT" "$DEFAULT" "$(out)"
 fi
 
-if it "magenta outranks slate"; then
+if it "a wake-up that never fired expires"; then
+  "$TAB_STATE" start
+  schedule ScheduleWakeup "$WAKEUP"
+  set_token loop -2000 -1100
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (default)" "$DEFAULT" "$(out)"
+  check "$CURRENT (dropped)" "absent" "$(exists "$STATE_DIR/wake-out-loop")"
+fi
+
+if it "a recurring cron job outlives the next prompt"; then
+  "$TAB_STATE" start
+  schedule CronCreate "$CRON" "$(job j1)"
+  "$TAB_STATE" reset
+  "$TAB_STATE" start
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT" "$SLATE" "$(out)"
+fi
+
+if it "a recurring cron job expires after its lifetime"; then
+  "$TAB_STATE" start
+  schedule CronCreate "$CRON" "$(job j1)"
+  echo "0 $(($(date +%s) - 1))" >"$STATE_DIR/wake-out-cron-j1"
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT" "$DEFAULT" "$(out)"
+fi
+
+if it "a one-shot cron job waits for its date"; then
+  "$TAB_STATE" start
+  schedule CronCreate "$ONESHOT" "$(job j2 false)"
+  read -r due _ <<<"$(wake_token at-j2)"
+  now=$(date +%s)
+  if [ "${due:-0}" -gt "$now" ] && [ "$due" -lt $((now + 367 * 86400)) ]; then
+    check "$CURRENT (due next new year)" "yes" "yes"
+  else
+    check "$CURRENT (due next new year)" "within a year" "${due:-none}"
+  fi
+  "$TAB_STATE" reset
+  "$TAB_STATE" start # an unrelated prompt
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (still pending)" "$SLATE" "$(out)"
+  set_token at-j2 -30 870 # its firing
+  "$TAB_STATE" start
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (dropped once fired)" "$DEFAULT" "$(out)"
+fi
+
+if it "a one-shot cron job with no fixed date counts as due now"; then
+  "$TAB_STATE" start
+  schedule CronCreate '{"cron":"*/5 * * * *","prompt":"p","recurring":false}' "$(job j3 false)"
+  "$TAB_STATE" start
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT" "$DEFAULT" "$(out)"
+fi
+
+if it "CronDelete drops only its own job"; then
+  "$TAB_STATE" start
+  schedule CronCreate "$CRON" "$(job j1)"
+  schedule CronCreate "$CRON" "$(job j2)"
+  schedule CronDelete '{"id":"j1"}' '{"id":"j1"}'
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (other job pending)" "$SLATE" "$(out)"
+  schedule CronDelete '{"id":"j2"}' '{"id":"j2"}'
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT (none left)" "$DEFAULT" "$(out)"
+fi
+
+if it "a CronCreate with no job id records nothing"; then
+  # A dark tab is the safe guess when the job cannot be told apart.
   "$TAB_STATE" start
   schedule CronCreate "$CRON"
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT" "$DEFAULT" "$(out)"
+fi
+
+if it "a value equal to a key name is not read as that key"; then
+  "$TAB_STATE" start
+  schedule ScheduleWakeup '{"delaySeconds":600,"prompt":"p","reason":"stop","x":true}'
+  clear_out
+  "$TAB_STATE" reset
+  check "$CURRENT" "$SLATE" "$(out)"
+fi
+
+if it "fields after a long prompt are still read"; then
+  long=$(printf '%*s' 10000 '' | tr ' ' x)
+  "$TAB_STATE" start
+  schedule CronCreate "{\"cron\":\"17 3 1 1 *\",\"prompt\":\"$long\",\"recurring\":false}" "$(job j4 false)"
+  check "$CURRENT (one-shot)" "present" "$(exists "$STATE_DIR/wake-out-at-j4")"
+  check "$CURRENT (not recurring)" "absent" "$(exists "$STATE_DIR/wake-out-cron-j4")"
+fi
+
+if it "magenta outranks slate"; then
+  "$TAB_STATE" start
+  schedule CronCreate "$CRON" "$(job j1)"
   spawn_shell
   clear_out
   "$TAB_STATE" reset
   check "$CURRENT" "$MAGENTA" "$(out)"
 fi
 
-if it "a lost wake-up ages out after a week"; then
-  "$TAB_STATE" start
-  schedule CronCreate "$CRON"
-  age "$STATE_DIR/wake-out-cron" 700000
-  clear_out
-  "$TAB_STATE" reset
-  check "$CURRENT (default)" "$DEFAULT" "$(out)"
-  check "$CURRENT (swept)" "absent" "$(exists "$STATE_DIR/wake-out-cron")"
-fi
-
 if it "a session boundary forgets wake-ups"; then
   "$TAB_STATE" start
-  schedule CronCreate "$CRON"
+  schedule CronCreate "$CRON" "$(job j1)"
   "$TAB_STATE" session </dev/null
   clear_out
   "$TAB_STATE" idle
@@ -752,7 +889,7 @@ fi
 
 if it "a green after the turn closed spares a pending wake-up"; then
   "$TAB_STATE" start
-  schedule CronCreate "$CRON"
+  schedule CronCreate "$CRON" "$(job j1)"
   "$TAB_STATE" reset
   clear_out
   "$TAB_STATE" green
@@ -761,7 +898,7 @@ fi
 
 # ----------------------------------------------------------- manual compaction
 
-if it "a manual compact between turns shows busy until it ends"; then
+if it "a manual compact on an idle tab shows busy until it ends"; then
   "$TAB_STATE" start
   "$TAB_STATE" reset
   clear_out
@@ -780,20 +917,30 @@ if it "a compact mid-turn paints nothing"; then
   check "$CURRENT" "" "$(out)"
 fi
 
-if it "a compact's end restores the color from before"; then
+if it "a compact does not paint over a color that says more"; then
   "$TAB_STATE" start
   fail_with overloaded
+  clear_out
+  "$TAB_STATE" compact-start
+  check "$CURRENT (red kept)" "" "$(out)"
+  "$TAB_STATE" compact-end
+  check "$CURRENT (red restored)" "$RED" "$(out)"
+fi
+
+if it "a cancelled compact ends at the idle nudge"; then
+  "$TAB_STATE" start
+  "$TAB_STATE" reset
   "$TAB_STATE" compact-start
   clear_out
-  "$TAB_STATE" compact-end
-  check "$CURRENT" "$RED" "$(out)"
+  "$TAB_STATE" idle
+  check "$CURRENT" "$DEFAULT" "$(out)"
 fi
 
 # --------------------------------------------------------------- disable flag
 
 if it "disabling forgets failures and wake-ups"; then
   "$TAB_STATE" start
-  schedule CronCreate "$CRON"
+  schedule CronCreate "$CRON" "$(job j1)"
   fail_with overloaded
   : >"$DISABLED"
   "$TAB_STATE" green
@@ -1042,7 +1189,7 @@ fi
 
 if it "a quiet red, orange or slate tab is spared while what backs it remains"; then
   mkdir -p "$STATE_DIR"
-  : >"$STATE_DIR/wake-other-cron"
+  echo "0 $(($(date +%s) + 3600))" >"$STATE_DIR/wake-other-cron-j1"
   for held in failed paused asleep; do
     other=$(strand $$ "$held")
     echo "$held" >"$STATE_DIR/fail-other"
@@ -1052,20 +1199,22 @@ if it "a quiet red, orange or slate tab is spared while what backs it remains"; 
   done
 fi
 
-if it "a red tab whose failure is gone ages out"; then
-  other=$(strand $$ failed)
-  age "$STATE_DIR/tty-other" 3600
-  "$TAB_STATE" reset
-  check "$CURRENT" "$DEFAULT" "$(cat "$other")"
+if it "a red, orange or slate tab with nothing behind it ages out"; then
+  for held in failed paused asleep; do
+    other=$(strand $$ "$held")
+    age "$STATE_DIR/tty-other" 3600
+    "$TAB_STATE" reset
+    check "$CURRENT ($held)" "$DEFAULT" "$(cat "$other")"
+  done
 fi
 
 if it "clearing a stranded tab drops its failure and wake-ups"; then
   other=$(strand "$(dead_pid)" failed)
   : >"$STATE_DIR/fail-other"
-  : >"$STATE_DIR/wake-other-once"
+  : >"$STATE_DIR/wake-other-loop"
   "$TAB_STATE" reset
   check "$CURRENT (failure)" "absent" "$(exists "$STATE_DIR/fail-other")"
-  check "$CURRENT (wake-up)" "absent" "$(exists "$STATE_DIR/wake-other-once")"
+  check "$CURRENT (wake-up)" "absent" "$(exists "$STATE_DIR/wake-other-loop")"
 fi
 
 if it "an unrecognized state ages out instead of being spared forever"; then
